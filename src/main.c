@@ -6,8 +6,9 @@ int main(int argc, char **argv) {
   glfwInit();
   GraphicsState graphics = InitGraphics();
 	Texture grassTexture;
-	OpenTexture(&grassTexture, "data/grass.ong");
-	UploadTexture(&graphics, &grassTexture);
+	Texture standardTexture;
+	OpenTexture(&graphics, &grassTexture, "data/textures/grass.png");
+	OpenTexture(&graphics, &standardTexture, "data/textures/standard.png");
   Model terrain = (Model){};
   terrain.vertices =
       malloc(sizeof(Vertex) * 512 * 512 *

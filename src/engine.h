@@ -15,6 +15,7 @@ typedef struct Vertex {
   vec4 position;
   vec4 color;
   vec4 normal;
+	vec2 uvcoords;
 } Vertex;
 
 typedef struct Model {
@@ -169,8 +170,9 @@ typedef struct GraphicsState {
   void *mappedStagingMemory;
   VkBuffer stagingBuffer;
   VkFence stagingFence;
-	// Textures
-	uint32_t textureCount;
+  // Textures
+  uint32_t textureCount;
+  Texture *textures[512]; // TODO: More magic array lengths
   // Entities
   EntityDef *entities;
   size_t entityCount;
@@ -244,6 +246,25 @@ void SetupCommandBuffer(GraphicsState *state, int frameNumber,
                                          .depth = 1.,
                                      }}}},
       VK_SUBPASS_CONTENTS_INLINE);
+  VkImageMemoryBarrier imageBarriers[state->imageCount];
+  for (uint32_t t = 0; t < state->textureCount; t++) {
+    imageBarriers[t] = (VkImageMemoryBarrier){
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .image = state->textures[t]->image,
+        .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                             .baseMipLevel = 0,
+                             .levelCount = 1,
+                             .baseArrayLayer = 0,
+                             .layerCount = 1}};
+  }
+  vkCmdPipelineBarrier(
+      state->commandbuffers[frameNumber], VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_DEPENDENCY_DEVICE_GROUP_BIT, 0,
+      NULL, 0, NULL, state->textureCount, imageBarriers);
   vkCmdBindDescriptorSets(state->commandbuffers[frameNumber],
                           VK_PIPELINE_BIND_POINT_GRAPHICS, state->layout, 0, 1,
                           &state->descriptorSets[frameNumber], 0,
@@ -265,14 +286,13 @@ void SetupCommandBuffer(GraphicsState *state, int frameNumber,
 
 VkShaderModule LoadShaderFromFile(VkDevice device, char *filepath) {
   VkShaderModule module;
-  uint32_t *code;
   if (!filepath) {
     fprintf(stderr, "Attempted to read shader from NULL filepath\n");
   }
   FILE *file = fopen(filepath, "r");
   fseek(file, 0, SEEK_END);
   uint32_t length = ftell(file);
-  code = malloc(sizeof(char) * length);
+  uint32_t code[length];
   fseek(file, 0, SEEK_SET);
   fread(code, sizeof(char), length, file);
   vkCreateShaderModule(device,
@@ -281,7 +301,6 @@ VkShaderModule LoadShaderFromFile(VkDevice device, char *filepath) {
                            .codeSize = length,
                            .pCode = code},
                        NULL, &module);
-  free(code);
   return module;
 }
 
@@ -351,14 +370,64 @@ void UpdateInputState(GraphicsState *state) {
   }
 }
 
-uint32_t OpenTexture(Texture *texture, char *filename) {
+void UpdateDescriptors(GraphicsState *state) {
+  VkWriteDescriptorSet vwds[MAX_SWAPCHAIN_IMAGES * 2];
+  for (uint32_t i = 0; i < state->imageCount; i++) {
+    uint32_t elementStart = i * 2;
+    vwds[elementStart] = (VkWriteDescriptorSet){
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = state->descriptorSets[i],
+        .dstArrayElement = 0,
+        .descriptorCount = 1,
+        .dstBinding = 0,
+        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+        .pBufferInfo =
+            (VkDescriptorBufferInfo[1]){{.buffer = state->cameraBuffer,
+                                         .offset = 0,
+                                         .range = sizeof(CameraState)}}};
+    vwds[elementStart + 1] = (VkWriteDescriptorSet){
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = state->descriptorSets[i],
+        .dstArrayElement = 0,
+        .descriptorCount = 1,
+        .dstBinding = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .pBufferInfo =
+            (VkDescriptorBufferInfo[1]){{.buffer = state->inputBuffer,
+                                         .offset = 0,
+                                         .range = sizeof(InputState)}}};
+  }
+  vkUpdateDescriptorSets(state->device, state->imageCount * 2, vwds, 0,
+                         VK_NULL_HANDLE);
+  if (state->textureCount > 0) {
+    VkWriteDescriptorSet vwds[MAX_SWAPCHAIN_IMAGES];
+    VkDescriptorImageInfo vdif[state->textureCount];
+    for (uint32_t t = 0; t < state->textureCount; t++) {
+      vdif[t] = (VkDescriptorImageInfo){.sampler = state->textures[t]->sampler,
+                                        .imageView = state->textures[t]->view,
+                                        .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+    }
+    for (uint32_t i = 0; i < state->imageCount; i++) {
+      vwds[i] = (VkWriteDescriptorSet){
+          .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+          .descriptorCount = state->textureCount,
+          .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+          .dstArrayElement = 0,
+          .dstBinding = 2,
+          .dstSet = state->descriptorSets[i],
+          .pImageInfo = vdif};
+    }
+    vkUpdateDescriptorSets(state->device, state->imageCount, vwds, 0,
+                           VK_NULL_HANDLE);
+  }
+}
+uint32_t OpenTexture(GraphicsState *state, Texture *texture, char *filename) {
   stbi_uc *texturestart = stbi_load(filename, &texture->width, &texture->height,
                                     &texture->components, 4);
   texture->tex = texturestart;
-  return 0;
-}
-
-uint32_t UploadTexture(GraphicsState *state, Texture *texture) {
+  texture->textureId = state->textureCount;
+  state->textures[state->textureCount] = texture;
+  state->textureCount++;
   vkCreateImage(
       state->device,
       &(VkImageCreateInfo){.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -371,46 +440,22 @@ uint32_t UploadTexture(GraphicsState *state, Texture *texture) {
                            .arrayLayers = 1,
                            .samples = VK_SAMPLE_COUNT_1_BIT,
                            .tiling = VK_IMAGE_TILING_LINEAR,
-                           .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT},
+                           .usage = VK_IMAGE_USAGE_SAMPLED_BIT |
+                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT},
       NULL, &texture->image);
   uint32_t typeCount;
   uint32_t *types = getMemoryTypeMatching(
       state->physicalDevice, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &typeCount);
+  VkMemoryRequirements memReqs;
+  vkGetImageMemoryRequirements(state->device, texture->image, &memReqs);
   vkAllocateMemory(
       state->device,
       &(VkMemoryAllocateInfo){.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-                              .allocationSize = texture->width *
-                                                texture->height * sizeof(char),
+                              .allocationSize = memReqs.size,
                               .memoryTypeIndex = types[0]},
       NULL, &texture->imageMemory);
   vkBindImageMemory(state->device, texture->image, texture->imageMemory, 0);
-  memcpy(state->mappedStagingMemory, texture->tex,
-         sizeof(char) * texture->width * texture->height);
-  VkCommandBuffer cb;
-  vkAllocateCommandBuffers(
-      state->device,
-      &(VkCommandBufferAllocateInfo){
-          .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-          .commandPool = state->commandPool,
-          .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-          .commandBufferCount = 1},
-      &cb);
-  vkBeginCommandBuffer(
-      cb, &(VkCommandBufferBeginInfo){
-              .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO});
-  vkCmdCopyBufferToImage(
-      cb, state->stagingBuffer, texture->image, VK_IMAGE_LAYOUT_GENERAL, 1,
-      &(VkBufferImageCopy){
-          .bufferOffset = 0,
-          .bufferRowLength = texture->width,
-          .bufferImageHeight = texture->height,
-          .imageSubresource = {.mipLevel = 1,
-                               .baseArrayLayer = 1,
-                               .layerCount = 1,
-                               .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT},
-          .imageOffset = {.x = 0, .y = 0, .z = 0},
-          .imageExtent = {
-              .width = texture->width, .height = texture->height, .depth = 1}});
+  memcpy(state->mappedStagingMemory, texture->tex, memReqs.size);
   vkCreateImageView(
       state->device,
       &(VkImageViewCreateInfo){
@@ -422,9 +467,10 @@ uint32_t UploadTexture(GraphicsState *state, Texture *texture) {
                          .g = VK_COMPONENT_SWIZZLE_G,
                          .b = VK_COMPONENT_SWIZZLE_B,
                          .a = VK_COMPONENT_SWIZZLE_A},
-          .subresourceRange = {.baseMipLevel = 1,
-                               .baseArrayLayer = 1,
+          .subresourceRange = {.baseMipLevel = 0,
+                               .baseArrayLayer = 0,
                                .layerCount = 1,
+                               .levelCount = 1,
                                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT},
       },
       NULL, &texture->view);
@@ -446,24 +492,57 @@ uint32_t UploadTexture(GraphicsState *state, Texture *texture) {
                              .minLod = 1,
                              .maxLod = 1},
       NULL, &texture->sampler);
-	// TODO: buffer overrun at high texture count
-	texture->textureId = state->textureCount++;
-  VkWriteDescriptorSet writes[MAX_SWAPCHAIN_IMAGES] = {};
-  for (uint32_t i = 0; i < state->imageCount; i++) {
-    writes[i].descriptorCount = 1;
-    writes[i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    writes[i].dstArrayElement = texture->textureId;
-    writes[i].dstBinding = 2;
-    writes[i].dstSet = state->descriptorSets[i];
-    writes[i].pImageInfo =
-        &(VkDescriptorImageInfo){.sampler = texture->sampler,
-                                 .imageView = texture->view,
-                                 .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+
+  VkCommandBuffer cb;
+  vkAllocateCommandBuffers(
+      state->device,
+      &(VkCommandBufferAllocateInfo){
+          .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+          .commandPool = state->commandPool,
+          .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+          .commandBufferCount = 1},
+      &cb);
+  vkBeginCommandBuffer(
+      cb, &(VkCommandBufferBeginInfo){
+              .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO});
+  vkCmdCopyBufferToImage(
+      cb, state->stagingBuffer, texture->image, VK_IMAGE_LAYOUT_GENERAL, 1,
+      &(VkBufferImageCopy){
+          .bufferOffset = 0,
+          .bufferRowLength = texture->width,
+          .bufferImageHeight = texture->height,
+          .imageSubresource = {.mipLevel = 0,
+                               .baseArrayLayer = 0,
+                               .layerCount = 1,
+                               .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT},
+          .imageOffset = {.x = 0, .y = 0, .z = 0},
+          .imageExtent = {
+              .width = texture->width, .height = texture->height, .depth = 1}});
+  vkEndCommandBuffer(cb);
+  VkQueue queue;
+  vkGetDeviceQueue(
+      state->device,
+      getQueuesMatching(state->physicalDevice, VK_QUEUE_TRANSFER_BIT, 0)[0], 0,
+      &queue);
+  vkQueueSubmit(queue, 1,
+                &(VkSubmitInfo){.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                                .waitSemaphoreCount = 0,
+                                .commandBufferCount = 1,
+                                .pCommandBuffers = &cb,
+                                .signalSemaphoreCount = 0},
+                state->stagingFence);
+  uint32_t res =
+      vkWaitForFences(state->device, 1, &state->stagingFence, 1, 1000000);
+  if (res == VK_TIMEOUT) {
+    printf("Timed out waiting for model loading fence to signal\n");
+    return 1;
   }
-  vkUpdateDescriptorSets(state->device, state->imageCount, writes, 0, 0);
+  vkResetFences(state->device, 1, &state->stagingFence);
+  UpdateDescriptors(state);
 
   return 0;
 }
+void SetupTextureDescriptor(GraphicsState *state, Texture *texture) {}
 
 /**
  * Upload a correctly formed Model to the graphics card.
@@ -648,7 +727,64 @@ uint32_t UpdateGraphicsMemory(GraphicsState *state) {
     return 1;
   }
   vkResetFences(state->device, 1, &state->entitySyncFence);
+
   return 0;
+}
+
+void SetupDescriptorSets(GraphicsState *state) {
+
+  // Descriptor Set
+  vkCreateDescriptorSetLayout(
+      state->device,
+      &(VkDescriptorSetLayoutCreateInfo){
+          .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+          .bindingCount = 3,
+          .pBindings =
+              (VkDescriptorSetLayoutBinding[3]){
+                  {.binding = 0,
+                   .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                   .descriptorCount = 1,
+                   .stageFlags = VK_SHADER_STAGE_VERTEX_BIT |
+                                 VK_SHADER_STAGE_FRAGMENT_BIT},
+                  {.binding = 1,
+                   .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                   .descriptorCount = 1,
+                   .stageFlags = VK_SHADER_STAGE_VERTEX_BIT |
+                                 VK_SHADER_STAGE_FRAGMENT_BIT},
+                  {.binding = 2,
+                   .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                   .descriptorCount =
+                       512, // TODO: Totally arbitrary, *will* run out soon.
+                   .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT}}},
+      NULL, &state->descriptorSetLayout);
+  vkCreateDescriptorPool(
+      state->device,
+      &(VkDescriptorPoolCreateInfo){
+          .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+          .maxSets = MAX_SWAPCHAIN_IMAGES,
+          .poolSizeCount = 3,
+          .pPoolSizes =
+              (VkDescriptorPoolSize[3]){
+                  {.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                   .descriptorCount = MAX_SWAPCHAIN_IMAGES},
+                  {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                   .descriptorCount = MAX_SWAPCHAIN_IMAGES},
+                  {.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                   .descriptorCount = 512 * MAX_SWAPCHAIN_IMAGES}}},
+      NULL, &state->descriptorPool);
+  vkAllocateDescriptorSets(
+      state->device,
+      &(VkDescriptorSetAllocateInfo){
+          .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+          .descriptorPool = state->descriptorPool,
+          .descriptorSetCount = state->imageCount,
+          .pSetLayouts =
+              (VkDescriptorSetLayout[MAX_SWAPCHAIN_IMAGES]){
+                  state->descriptorSetLayout, state->descriptorSetLayout,
+                  state->descriptorSetLayout}},
+      state->descriptorSets);
+
+  UpdateDescriptors(state);
 }
 
 void CreateRenderState(GraphicsState *state) {
@@ -743,6 +879,7 @@ void CreateRenderState(GraphicsState *state) {
   vkGetSwapchainImagesKHR(state->device, state->swapchain, &count,
                           state->swapchainImages);
   state->imageCount = count;
+  SetupDescriptorSets(state);
   vkAllocateCommandBuffers(
       state->device,
       &(VkCommandBufferAllocateInfo){
@@ -751,56 +888,6 @@ void CreateRenderState(GraphicsState *state) {
           .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
           .commandBufferCount = count},
       state->commandbuffers);
-
-  // Descriptor Set
-  vkCreateDescriptorSetLayout(
-      state->device,
-      &(VkDescriptorSetLayoutCreateInfo){
-          .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-          .bindingCount = 3,
-          .pBindings =
-              (VkDescriptorSetLayoutBinding[3]){
-                  {.binding = 0,
-                   .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-                   .descriptorCount = 1,
-                   .stageFlags = VK_SHADER_STAGE_VERTEX_BIT |
-                                 VK_SHADER_STAGE_FRAGMENT_BIT},
-                  {.binding = 1,
-                   .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                   .descriptorCount = 1,
-                   .stageFlags = VK_SHADER_STAGE_VERTEX_BIT |
-                                 VK_SHADER_STAGE_FRAGMENT_BIT},
-                  {.binding = 2,
-                   .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                   .descriptorCount =
-                       512, // TODO: Totally arbitrary, *will* run out soon.
-                   .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT}}},
-      NULL, &state->descriptorSetLayout);
-  vkCreateDescriptorPool(
-      state->device,
-      &(VkDescriptorPoolCreateInfo){
-          .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-          .maxSets = MAX_SWAPCHAIN_IMAGES,
-          .poolSizeCount = 2,
-          .pPoolSizes =
-              (VkDescriptorPoolSize[2]){
-                  {.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-                   .descriptorCount = MAX_SWAPCHAIN_IMAGES},
-                  {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                   .descriptorCount = MAX_SWAPCHAIN_IMAGES}}},
-      NULL, &state->descriptorPool);
-  VkWriteDescriptorSet vwds[MAX_SWAPCHAIN_IMAGES * 2];
-  vkAllocateDescriptorSets(
-      state->device,
-      &(VkDescriptorSetAllocateInfo){
-          .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-          .descriptorPool = state->descriptorPool,
-          .descriptorSetCount = state->imageCount,
-          .pSetLayouts =
-              (VkDescriptorSetLayout[MAX_SWAPCHAIN_IMAGES]){
-                  state->descriptorSetLayout, state->descriptorSetLayout,
-                  state->descriptorSetLayout}},
-      state->descriptorSets);
   // Per image state
   for (uint32_t i = 0; i < state->imageCount; i++) {
     vkCreateImage(state->device,
@@ -858,28 +945,6 @@ void CreateRenderState(GraphicsState *state) {
                                  .baseArrayLayer = 0,
                                  .layerCount = 1}},
         0, &imageView[1]);
-    vwds[i * 2] = (VkWriteDescriptorSet){
-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .dstSet = state->descriptorSets[i],
-        .dstArrayElement = 0,
-        .descriptorCount = 1,
-        .dstBinding = 0,
-        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        .pBufferInfo =
-            (VkDescriptorBufferInfo[1]){{.buffer = state->cameraBuffer,
-                                         .offset = 0,
-                                         .range = sizeof(CameraState)}}};
-    vwds[i * 2 + 1] = (VkWriteDescriptorSet){
-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .dstSet = state->descriptorSets[i],
-        .dstArrayElement = 0,
-        .descriptorCount = 1,
-        .dstBinding = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .pBufferInfo =
-            (VkDescriptorBufferInfo[1]){{.buffer = state->inputBuffer,
-                                         .offset = 0,
-                                         .range = sizeof(InputState)}}};
     vkCreateFramebuffer(state->device,
                         &(VkFramebufferCreateInfo){
                             .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
@@ -891,8 +956,6 @@ void CreateRenderState(GraphicsState *state) {
                             .layers = 1},
                         0, &state->framebuffers[i]);
   }
-  vkUpdateDescriptorSets(state->device, state->imageCount * 2, vwds, 0,
-                         VK_NULL_HANDLE);
 
   vkCreatePipelineLayout(
       state->device,

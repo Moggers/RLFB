@@ -8,6 +8,7 @@ layout(location = 3) in mat4 instanceRotation;
 layout(location = 7) in vec3 instancePosition;
 layout(location = 8) in vec3 instanceScale;
 layout(location = 9) in uint instanceId;
+layout(location = 10) in uint textureId;
 
 layout(set = 0, binding = 0) uniform Block {
 	mat4 model;
@@ -28,8 +29,7 @@ layout(set = 0, binding = 1) buffer Block {
 layout(location = 0) out vec3 fragColor;
 layout(location = 1) out vec3 fragNorm;
 layout(location = 2) out flat uint outInstanceId;
-layout(location = 3) out mat4 mvp;
-layout(location = 7) out vec4 preproj;
+layout(location = 3) out flat uint textureId;
 
 void main() {
 		if((mouseButtons & 2) == 2) {
@@ -44,8 +44,6 @@ void main() {
 			}
 		}
     gl_Position = (proj * inverse(view)) * (instanceRotation * vec4(inPosition * instanceScale,1) + vec4(instancePosition,1));
-		mvp = proj * view;
-		preproj = (instanceRotation * vec4(inPosition * instanceScale,1) + vec4(instancePosition,1));
     fragColor = inColor;
 		fragNorm = vec3(instanceRotation * vec4(inNorm, 1));
 		outInstanceId = instanceId;
