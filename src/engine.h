@@ -15,7 +15,8 @@ typedef struct Vertex {
   vec4 position;
   vec4 color;
   vec4 normal;
-	vec2 uvcoords;
+  vec2 uvcoords;
+  float blendFactor;
 } Vertex;
 
 typedef struct Model {
@@ -44,6 +45,8 @@ typedef struct Instance {
   vec4 scale;
   uint32_t instanceId;
   bool selected;
+  uint32_t textureId1;
+  uint32_t textureId2;
 } Instance;
 
 typedef struct EntityDef {
@@ -397,16 +400,17 @@ void UpdateDescriptors(GraphicsState *state) {
                                          .offset = 0,
                                          .range = sizeof(InputState)}}};
   }
-  vkUpdateDescriptorSets(state->device, state->imageCount * 2, vwds, 0,
-                         VK_NULL_HANDLE);
+
   if (state->textureCount > 0) {
-    VkWriteDescriptorSet vwds[MAX_SWAPCHAIN_IMAGES];
     VkDescriptorImageInfo vdif[state->textureCount];
     for (uint32_t t = 0; t < state->textureCount; t++) {
       vdif[t] = (VkDescriptorImageInfo){.sampler = state->textures[t]->sampler,
                                         .imageView = state->textures[t]->view,
                                         .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
     }
+    vkUpdateDescriptorSets(state->device, state->imageCount * 2, vwds, 0,
+                           VK_NULL_HANDLE);
+    VkWriteDescriptorSet vwds[MAX_SWAPCHAIN_IMAGES];
     for (uint32_t i = 0; i < state->imageCount; i++) {
       vwds[i] = (VkWriteDescriptorSet){
           .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -428,6 +432,7 @@ uint32_t OpenTexture(GraphicsState *state, Texture *texture, char *filename) {
   texture->textureId = state->textureCount;
   state->textures[state->textureCount] = texture;
   state->textureCount++;
+	printf("Component count: %d\n", texture->components);
   vkCreateImage(
       state->device,
       &(VkImageCreateInfo){.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -542,7 +547,6 @@ uint32_t OpenTexture(GraphicsState *state, Texture *texture, char *filename) {
 
   return 0;
 }
-void SetupTextureDescriptor(GraphicsState *state, Texture *texture) {}
 
 /**
  * Upload a correctly formed Model to the graphics card.
@@ -998,9 +1002,9 @@ void CreateRenderState(GraphicsState *state) {
                            {.binding = 1,
                             .stride = sizeof(Instance),
                             .inputRate = VK_VERTEX_INPUT_RATE_INSTANCE}},
-                   .vertexAttributeDescriptionCount = 11,
+                   .vertexAttributeDescriptionCount = 14,
                    .pVertexAttributeDescriptions =
-                       (VkVertexInputAttributeDescription[11]){
+                       (VkVertexInputAttributeDescription[14]){
                            {.location = 0,
                             .binding = 0,
                             .format = VK_FORMAT_R32G32B32A32_SFLOAT,
@@ -1044,7 +1048,19 @@ void CreateRenderState(GraphicsState *state) {
                            {.location = 10,
                             .binding = 1,
                             .format = VK_FORMAT_R32_UINT,
-                            .offset = offsetof(Instance, selected)}}},
+                            .offset = offsetof(Instance, textureId1)},
+                           {.location = 11,
+                            .binding = 1,
+                            .format = VK_FORMAT_R32_UINT,
+                            .offset = offsetof(Instance, textureId2)},
+                           {.location = 12,
+                            .binding = 0,
+                            .format = VK_FORMAT_R32G32_SFLOAT,
+                            .offset = offsetof(Vertex, uvcoords)},
+                           {.location = 13,
+                            .binding = 0,
+                            .format = VK_FORMAT_R32_SFLOAT,
+                            .offset = offsetof(Vertex, blendFactor)}}},
            .pInputAssemblyState =
                &(VkPipelineInputAssemblyStateCreateInfo){
                    .sType =
@@ -1130,7 +1146,7 @@ void CreateRenderState(GraphicsState *state) {
   glm_perspective(80,
                   (float)capabilites.currentExtent.width /
                       (float)capabilites.currentExtent.height,
-                  0.1, 50, state->camera->proj);
+                  0.01, 500, state->camera->proj);
 }
 
 void CleanRenderState(GraphicsState *state) {

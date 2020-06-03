@@ -8,7 +8,10 @@ layout(location = 3) in mat4 instanceRotation;
 layout(location = 7) in vec3 instancePosition;
 layout(location = 8) in vec3 instanceScale;
 layout(location = 9) in uint instanceId;
-layout(location = 10) in uint textureId;
+layout(location = 10) in uint textureId1;
+layout(location = 11) in uint textureId2;
+layout(location = 12) in vec2 uvcoords;
+layout(location = 13) in float blendFactor;
 
 layout(set = 0, binding = 0) uniform Block {
 	mat4 model;
@@ -29,7 +32,10 @@ layout(set = 0, binding = 1) buffer Block {
 layout(location = 0) out vec3 fragColor;
 layout(location = 1) out vec3 fragNorm;
 layout(location = 2) out flat uint outInstanceId;
-layout(location = 3) out flat uint textureId;
+layout(location = 3) out flat uint outTextureId1;
+layout(location = 4) out flat uint outTextureId2;
+layout(location = 5) out vec2 outUV;
+layout(location = 6) out float outBlendFactor;
 
 void main() {
 		if((mouseButtons & 2) == 2) {
@@ -47,4 +53,8 @@ void main() {
     fragColor = inColor;
 		fragNorm = vec3(instanceRotation * vec4(inNorm, 1));
 		outInstanceId = instanceId;
+		outTextureId1 = textureId1;
+		outTextureId2 = textureId2;
+		outBlendFactor = blendFactor;
+		outUV = uvcoords;
 }

@@ -4,10 +4,12 @@
 layout(location = 0) in vec3 fragColor;
 layout(location = 1) in vec3 fragNorm;
 layout(location = 2) in flat uint instanceId;
-layout(location = 3) in flat uint textureId;
+layout(location = 3) in flat uint textureId1;
+layout(location = 4) in flat uint textureId2;
+layout(location = 5) in vec2 uvcoords;
+layout(location = 6) in float blendFactor;
 
 layout(location = 0) out vec4 outColor;
-
 layout(set = 0, binding = 1) buffer Block {
 	vec4 mouse;
 	vec2 windowSize;
@@ -17,7 +19,6 @@ layout(set = 0, binding = 1) buffer Block {
 	uint selectionMap[4096];
 	uint selectionBuffer[256];
 };
-
 layout(binding = 2) uniform sampler2D textures[512];
 
 void main() {
@@ -38,9 +39,12 @@ void main() {
 			}
 		}
 	}
+	vec4 blendedTexture = texture(textures[textureId1], uvcoords) * blendFactor + texture(textures[textureId2], uvcoords) * (1-blendFactor);
+	// vec4 blendedTexture = texture(textures[textureId1], uvcoords);
+	// float lightAdjustment = dot(fragNorm, vec3(0, 1, 0));
+	float lightAdjustment = 1;
 	if(selectionMap[instanceId] != 0) {
-		outColor = (vec4(dot(fragNorm, vec3(0,0.7,0.7)) * fragColor * 0.2 + vec3(0.1, 0.1, 0.4), 1.0)* texture(textures[0], vec2(0,0))  + 0.2 ) / 1.2 ;
 	} else {
-		outColor = (vec4(dot(fragNorm, vec3(0,0.7,0.7)) * fragColor, 1.0)* texture(textures[0], vec2(0,0))  + 0.2 ) / 1.2 ;
 	}
+	outColor = vec4(lightAdjustment * fragColor, 1.0) * blendedTexture;
 }

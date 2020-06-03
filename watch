@@ -1,0 +1,4 @@
+#!/bin/bash
+while inotifywait -r -e modify,create,delete,move .; do
+	cd build; ninja; cd ..
+done
