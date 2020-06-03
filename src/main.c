@@ -42,7 +42,7 @@ int main(int argc, char **argv) {
       glm_normalize(cross2);
       vec3 norm;
       glm_vec3_cross(cross2, cross1, norm);
-			float blendFactor = glm_vec3_dot(norm, (vec3){0, 1, 0}) * 10 - 9.2;
+			float blendFactor = glm_vec3_dot(norm, (vec3){0, 1, 0}) * 10 - 9.1;
       // Row i, column t, stride of 6
       memcpy(&terrain.vertices[(i + t * 512) * 6],
              &(Vertex){.normal = {norm[0], norm[1], norm[2], 1},

@@ -40,11 +40,9 @@ void main() {
 		}
 	}
 	vec4 blendedTexture = texture(textures[textureId1], uvcoords) * blendFactor + texture(textures[textureId2], uvcoords) * (1-blendFactor);
-	// vec4 blendedTexture = texture(textures[textureId1], uvcoords);
-	// float lightAdjustment = dot(fragNorm, vec3(0, 1, 0));
-	float lightAdjustment = 1;
+	float lightAdjustment = dot(fragNorm, vec3(0, 1, 0));
 	if(selectionMap[instanceId] != 0) {
 	} else {
 	}
-	outColor = vec4(lightAdjustment * fragColor, 1.0) * blendedTexture;
+	outColor = vec4(lightAdjustment * fragColor, 1.0) * blendedTexture * lightAdjustment;
 }
