@@ -4,6 +4,7 @@
 * [Meson](https://mesonbuild.com/)
 * [Ninja](https://ninja-build.org/)
 * [GLFW](https://www.glfw.org/)
+* [ASSIMP](https://www.assimp.org/) (Not actually used since we have no assets, but implemented for testing)
 
 ## Building
 * `make build`
