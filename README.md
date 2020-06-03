@@ -3,6 +3,7 @@
 * [Vulkan](https://www.lunarg.com/vulkan-sdk/)
 * [Meson](https://mesonbuild.com/)
 * [Ninja](https://ninja-build.org/)
+* [GLFW](https://www.glfw.org/)
 
 ## Building
 * `make build`
