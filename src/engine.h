@@ -1,4 +1,5 @@
 #include <cglm/cglm.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -250,24 +251,6 @@ void SetupCommandBuffer(GraphicsState *state, int frameNumber,
                                      }}}},
       VK_SUBPASS_CONTENTS_INLINE);
   VkImageMemoryBarrier imageBarriers[state->imageCount];
-  for (uint32_t t = 0; t < state->textureCount; t++) {
-    imageBarriers[t] = (VkImageMemoryBarrier){
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-        .image = state->textures[t]->image,
-        .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                             .baseMipLevel = 0,
-                             .levelCount = 1,
-                             .baseArrayLayer = 0,
-                             .layerCount = 1}};
-  }
-  vkCmdPipelineBarrier(
-      state->commandbuffers[frameNumber], VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_DEPENDENCY_DEVICE_GROUP_BIT, 0,
-      NULL, 0, NULL, state->textureCount, imageBarriers);
   vkCmdBindDescriptorSets(state->commandbuffers[frameNumber],
                           VK_PIPELINE_BIND_POINT_GRAPHICS, state->layout, 0, 1,
                           &state->descriptorSets[frameNumber], 0,
@@ -404,9 +387,10 @@ void UpdateDescriptors(GraphicsState *state) {
   if (state->textureCount > 0) {
     VkDescriptorImageInfo vdif[state->textureCount];
     for (uint32_t t = 0; t < state->textureCount; t++) {
-      vdif[t] = (VkDescriptorImageInfo){.sampler = state->textures[t]->sampler,
-                                        .imageView = state->textures[t]->view,
-                                        .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+      vdif[t] = (VkDescriptorImageInfo){
+          .sampler = state->textures[t]->sampler,
+          .imageView = state->textures[t]->view,
+          .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     }
     vkUpdateDescriptorSets(state->device, state->imageCount * 2, vwds, 0,
                            VK_NULL_HANDLE);
@@ -425,23 +409,26 @@ void UpdateDescriptors(GraphicsState *state) {
                            VK_NULL_HANDLE);
   }
 }
+// TODO: Something wrong with sizing here, vulkan allocates a texture image of
+// 			 larger size than required to ensure power-of-two sized
+// textures, so the 			 copy in *can* fail.
 uint32_t OpenTexture(GraphicsState *state, Texture *texture, char *filename) {
   stbi_uc *texturestart = stbi_load(filename, &texture->width, &texture->height,
-                                    &texture->components, 4);
+                                    &texture->components, STBI_rgb_alpha);
   texture->tex = texturestart;
   texture->textureId = state->textureCount;
   state->textures[state->textureCount] = texture;
   state->textureCount++;
-	printf("Component count: %d\n", texture->components);
+  uint32_t mipLevels = floor(log2(fmax(texture->width, texture->height))) + 1;
   vkCreateImage(
       state->device,
       &(VkImageCreateInfo){.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
                            .imageType = VK_IMAGE_TYPE_2D,
-                           .format = VK_FORMAT_R8G8B8A8_UNORM,
+                           .format = VK_FORMAT_R8G8B8A8_SRGB,
                            .extent = {.width = texture->width,
                                       .height = texture->height,
                                       .depth = 1},
-                           .mipLevels = 1,
+                           .mipLevels = mipLevels,
                            .arrayLayers = 1,
                            .samples = VK_SAMPLE_COUNT_1_BIT,
                            .tiling = VK_IMAGE_TILING_LINEAR,
@@ -460,14 +447,14 @@ uint32_t OpenTexture(GraphicsState *state, Texture *texture, char *filename) {
                               .memoryTypeIndex = types[0]},
       NULL, &texture->imageMemory);
   vkBindImageMemory(state->device, texture->image, texture->imageMemory, 0);
-  memcpy(state->mappedStagingMemory, texture->tex, memReqs.size);
+  memcpy((stbi_uc *)state->mappedStagingMemory, texture->tex, texture->width * texture->height * sizeof(char)); 
   vkCreateImageView(
       state->device,
       &(VkImageViewCreateInfo){
           .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
           .image = texture->image,
           .viewType = VK_IMAGE_VIEW_TYPE_2D,
-          .format = VK_FORMAT_R8G8B8A8_UNORM,
+          .format = VK_FORMAT_R8G8B8A8_SRGB,
           .components = {.r = VK_COMPONENT_SWIZZLE_R,
                          .g = VK_COMPONENT_SWIZZLE_G,
                          .b = VK_COMPONENT_SWIZZLE_B,
@@ -475,7 +462,7 @@ uint32_t OpenTexture(GraphicsState *state, Texture *texture, char *filename) {
           .subresourceRange = {.baseMipLevel = 0,
                                .baseArrayLayer = 0,
                                .layerCount = 1,
-                               .levelCount = 1,
+                               .levelCount = mipLevels,
                                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT},
       },
       NULL, &texture->view);
@@ -485,17 +472,17 @@ uint32_t OpenTexture(GraphicsState *state, Texture *texture, char *filename) {
       &(VkSamplerCreateInfo){.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
                              .magFilter = VK_FILTER_NEAREST,
                              .minFilter = VK_FILTER_NEAREST,
-                             .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+                             .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
                              .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
                              .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
                              .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
                              .mipLodBias = 0,
-                             .anisotropyEnable = 0,
-                             .maxAnisotropy = 0,
+                             .anisotropyEnable = VK_TRUE,
+                             .maxAnisotropy = 1.f,
                              .compareEnable = 0,
                              .compareOp = VK_COMPARE_OP_NEVER,
-                             .minLod = 1,
-                             .maxLod = 1},
+                             .minLod = 0,
+                             .maxLod = mipLevels},
       NULL, &texture->sampler);
 
   VkCommandBuffer cb;
@@ -510,6 +497,14 @@ uint32_t OpenTexture(GraphicsState *state, Texture *texture, char *filename) {
   vkBeginCommandBuffer(
       cb, &(VkCommandBufferBeginInfo){
               .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO});
+  vkCmdPipelineBarrier(
+      cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+      NULL, 0, NULL, 1,
+      &(VkImageMemoryBarrier){.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                              .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                              .image = texture->image,
+                              .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                              .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT});
   vkCmdCopyBufferToImage(
       cb, state->stagingBuffer, texture->image, VK_IMAGE_LAYOUT_GENERAL, 1,
       &(VkBufferImageCopy){
@@ -523,6 +518,68 @@ uint32_t OpenTexture(GraphicsState *state, Texture *texture, char *filename) {
           .imageOffset = {.x = 0, .y = 0, .z = 0},
           .imageExtent = {
               .width = texture->width, .height = texture->height, .depth = 1}});
+  uint32_t mipWidth = texture->width;
+  uint32_t mipHeight = texture->height;
+  for (uint32_t t = 1; t < mipLevels; t++) {
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1,
+                         &(VkImageMemoryBarrier){
+                             .subresourceRange =
+                                 {
+                                     .baseMipLevel = t - 1,
+                                 },
+                             .image = texture->image,
+                             .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                             .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                             .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT});
+    vkCmdBlitImage(
+        cb, texture->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        texture->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+        &(VkImageBlit){
+            .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                               .mipLevel = t - 1,
+                               .baseArrayLayer = 0,
+                               .layerCount = 1},
+            .srcOffsets = {{0, 0, 0}, {mipWidth, mipHeight, 0}},
+            .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                               .mipLevel = t,
+                               .baseArrayLayer = 0,
+                               .layerCount = 1},
+            .dstOffsets = {{0, 0, 0},
+                           {mipWidth > 1 ? mipWidth / 2 : 1,
+                            mipHeight > 1 ? mipHeight / 2 : 1, 0}}},
+        VK_FILTER_LINEAR);
+    vkCmdPipelineBarrier(
+        cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+        0, NULL, 0, NULL, 1,
+        &(VkImageMemoryBarrier){
+            .subresourceRange =
+                {
+                    .baseMipLevel = t - 1,
+                },
+            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .image = texture->image,
+            .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT});
+
+    mipWidth /= 2;
+    mipHeight /= 2;
+  }
+  vkCmdPipelineBarrier(
+      cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+      NULL, 0, NULL, 1,
+      &(VkImageMemoryBarrier){.subresourceRange =
+                                  {
+                                      .baseMipLevel = mipLevels - 1,
+                                  },
+                              .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                              .image = texture->image,
+                              .newLayout =
+                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                              .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+                              .dstAccessMask = VK_ACCESS_SHADER_READ_BIT});
   vkEndCommandBuffer(cb);
   VkQueue queue;
   vkGetDeviceQueue(
@@ -671,9 +728,9 @@ uint32_t UpdateGraphicsMemory(GraphicsState *state) {
     EntityDef *def = &state->entities[t];
     // Setup entity def's instance buffer if necessary
     // Instance buffer will be double required size
-    // When instance count becomes as big or bigger than the buffer, buffer will
-    // be destroyed and resized, all instances will be marked dirty to force a
-    // resync
+    // When instance count becomes as big or bigger than the buffer, buffer
+    // will be destroyed and resized, all instances will be marked dirty to
+    // force a resync
     if (def->instanceBuffer && def->instanceCount >= def->bufferInstanceCount) {
       vkDestroyBuffer(state->device, def->instanceBuffer, NULL);
       vkFreeMemory(state->device, def->instanceMemory, NULL);
@@ -758,7 +815,8 @@ void SetupDescriptorSets(GraphicsState *state) {
                   {.binding = 2,
                    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                    .descriptorCount =
-                       512, // TODO: Totally arbitrary, *will* run out soon.
+                       16, // TODO: Totally arbitrary, *will* run out soon.
+                           // Texture should be swapped in and out
                    .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT}}},
       NULL, &state->descriptorSetLayout);
   vkCreateDescriptorPool(
@@ -1209,7 +1267,8 @@ GraphicsState InitGraphics() {
       &(VkDeviceCreateInfo){
           .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
           .pEnabledFeatures =
-              &(VkPhysicalDeviceFeatures){.fragmentStoresAndAtomics = true},
+              &(VkPhysicalDeviceFeatures){.samplerAnisotropy = VK_TRUE,
+                                          .fragmentStoresAndAtomics = VK_TRUE},
           .enabledExtensionCount = 1,
           .ppEnabledExtensionNames =
               &(const char *){VK_KHR_SWAPCHAIN_EXTENSION_NAME},
@@ -1265,7 +1324,7 @@ GraphicsState InitGraphics() {
       0, &state.commandPool);
 
   // Model loading
-  CreateBuffer(device, physicalDevice, 5000000 * sizeof(Vertex),
+  CreateBuffer(device, physicalDevice, 50000000 * sizeof(Vertex),
                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
                VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &state.stagingBuffer,
                &state.stagingMemory);

@@ -1,14 +1,48 @@
 #include "engine.h"
+#include <cglm/mat4.h>
 #include <cglm/vec3.h>
 #define STB_PERLIN_IMPLEMENTATION
 #include "stb_perlin.h"
 int main(int argc, char **argv) {
   glfwInit();
   GraphicsState graphics = InitGraphics();
-  Texture grassTexture, standardTexture, dirtTexture;
+  Texture grassTexture, standardTexture, dirtTexture, albedoTexture;
   OpenTexture(&graphics, &grassTexture, "data/textures/grass.png");
   OpenTexture(&graphics, &dirtTexture, "data/textures/dirt.png");
   OpenTexture(&graphics, &standardTexture, "data/textures/standard.png");
+  OpenTexture(&graphics, &albedoTexture, "data/textures/albedo.png");
+  Model water = (Model){};
+  water.vertices = (Vertex[6]){{.position = {0, 0, 0},
+                                .color = {0, 0, 1, 0.8},
+                                .normal = {0, 1, 0},
+                                .uvcoords = {0, 0}},
+                               {.position = {1, 0, 0},
+                                .color = {0, 0, 1, 0.8},
+                                .normal = {0, 1, 0},
+                                .uvcoords = {0, 0}},
+                               {.position = {0, 1, 0},
+                                .color = {0, 0, 1, 0.8},
+                                .normal = {0, 1, 0},
+                                .uvcoords = {0, 0}},
+                               {.position = {1, 0, 0},
+                                .color = {0, 0, 1, 0.8},
+                                .normal = {0, 1, 0},
+                                .uvcoords = {0, 0}},
+                               {.position = {0, 1, 0},
+                                .color = {0, 0, 1, 0.8},
+                                .normal = {0, 1, 0},
+                                .uvcoords = {0, 0}},
+                               {.position = {1, 1, 0},
+                                .color = {0, 0, 1, 0.8},
+                                .normal = {0, 1, 0},
+                                .uvcoords = {0, 0}}};
+  uint32_t waterDef = CreateEntityDef(&graphics, &water);
+  Instance waterInstance = {.position = {0, 0, 0},
+                            .scale = {512, 512, 1},
+                            .textureId1 = albedoTexture.textureId,
+                            .textureId2 = albedoTexture.textureId};
+  glm_mat4_identity(waterInstance.rotation);
+  AddEntityInstance(&graphics.entities[waterDef], waterInstance);
   Model terrain = (Model){};
   terrain.vertices =
       malloc(sizeof(Vertex) * 512 * 512 *
@@ -42,7 +76,7 @@ int main(int argc, char **argv) {
       glm_normalize(cross2);
       vec3 norm;
       glm_vec3_cross(cross2, cross1, norm);
-			float blendFactor = glm_vec3_dot(norm, (vec3){0, 1, 0}) * 10 - 9.1;
+      float blendFactor = glm_vec3_dot(norm, (vec3){0, 1, 0}) * 10 - 9.1;
       // Row i, column t, stride of 6
       memcpy(&terrain.vertices[(i + t * 512) * 6],
              &(Vertex){.normal = {norm[0], norm[1], norm[2], 1},
@@ -89,12 +123,12 @@ int main(int argc, char **argv) {
     }
   }
   uint32_t terrainDef = CreateEntityDef(&graphics, &terrain);
-  Instance inst = {.position = {0, 0, 0},
-                   .scale = {1, 1, 1},
-                   .textureId1 = grassTexture.textureId,
-                   .textureId2 = dirtTexture.textureId};
-  glm_mat4_identity(inst.rotation);
-  AddEntityInstance(&graphics.entities[terrainDef], inst);
+  Instance terrainInstance = {.position = {0, 0, 0},
+                              .scale = {1, 1, 1},
+                              .textureId1 = grassTexture.textureId,
+                              .textureId2 = dirtTexture.textureId};
+  glm_mat4_identity(terrainInstance.rotation);
+  AddEntityInstance(&graphics.entities[terrainDef], terrainInstance);
 
   while (true) {
     if (glfwWindowShouldClose(graphics.window)) {
