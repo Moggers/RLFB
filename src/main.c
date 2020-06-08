@@ -338,7 +338,7 @@ int main(int argc, char **argv) {
     }
     glfwPollEvents();
     MoveCamera(&graphics);
-    updateUnit(&standardUnit, graphics.input);
+    updateUnit(&standardUnit, &graphics.input);
     DrawGraphics(&graphics);
   }
 }

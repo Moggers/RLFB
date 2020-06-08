@@ -133,15 +133,22 @@ typedef struct InputOutputBuffer {
   vec4 worldMouse;
 } InputOutputBuffer;
 
-typedef struct InputState {
-  // Sent to GPU
+typedef struct InputInputBuffer {
   vec4 mouse;
   vec2 windowSize;
   uint32_t mouseButtons;
-  // CPU only
+} InputInputBuffer;
+
+typedef struct InputState {
+  vec4 mouse;
+  vec2 windowSize;
+  uint32_t mouseButtons;
   vec4 worldMouse; // Copied from GPU
   VkBuffer inputOutputBuffers[MAX_SWAPCHAIN_IMAGES];
   VkDeviceMemory inputOutputMemory;
+  VkBuffer inputInputBuffer;
+  VkDeviceMemory inputInputMemory;
+  InputInputBuffer *mappedIIB;
 } InputState;
 
 typedef struct GraphicsState {
@@ -175,8 +182,6 @@ typedef struct GraphicsState {
   VkDescriptorSetLayout descriptorSetLayout;
   VkBuffer cameraBuffer;
   VkDeviceMemory cameraMemory;
-  VkBuffer inputBuffer;
-  VkDeviceMemory inputMemory;
   VkFence inputReadFence;
   VkBuffer stagingInputBuffer;
   VkDeviceMemory stagingInputMemory;
@@ -197,7 +202,7 @@ typedef struct GraphicsState {
   VkCommandBuffer inputReadCommandBuffer;
   bool commandBufferDirty;
   CameraState *camera;
-  InputState *input;
+  InputState input;
 } GraphicsState;
 
 uint32_t *getMemoryTypeMatching(VkPhysicalDevice physicalDevice,
@@ -246,6 +251,9 @@ void SetupCommandBuffer(GraphicsState *state, int frameNumber,
   vkCmdBindPipeline(state->commandbuffers[frameNumber],
                     VK_PIPELINE_BIND_POINT_GRAPHICS,
                     state->graphicsPipelines[0]);
+  vkCmdFillBuffer(state->commandbuffers[frameNumber],
+                  state->input.inputOutputBuffers[frameNumber], 0,
+                  sizeof(InputOutputBuffer), 0);
   vkCmdBeginRenderPass(
       state->commandbuffers[frameNumber],
       &(VkRenderPassBeginInfo){
@@ -261,9 +269,6 @@ void SetupCommandBuffer(GraphicsState *state, int frameNumber,
                                          .depth = 1.,
                                      }}}},
       VK_SUBPASS_CONTENTS_INLINE);
-  vkCmdFillBuffer(state->commandbuffers[frameNumber],
-                  state->input->inputOutputBuffers[frameNumber], 0,
-                  sizeof(InputOutputBuffer), 0);
   vkCmdBindDescriptorSets(state->commandbuffers[frameNumber],
                           VK_PIPELINE_BIND_POINT_GRAPHICS, state->layout, 0, 1,
                           &state->descriptorSets[frameNumber], 0,
@@ -333,51 +338,54 @@ void CreateBuffer(VkDevice device, VkPhysicalDevice physical, size_t size,
                               .queueFamilyIndexCount = 1,
                               .pQueueFamilyIndices = getQueuesMatching(
                                   physical, VK_QUEUE_TRANSFER_BIT, 0)},
-        NULL, buffer);
-    vkBindBufferMemory(device, *buffer, *memory, size * t);
+        NULL, &buffer[t]);
+    vkBindBufferMemory(device, buffer[t], *memory, size * t);
   }
 }
 
 void UpdateInputState(GraphicsState *state) {
 
-  state->input->windowSize[0] = state->renderArea.width;
-  state->input->windowSize[1] = state->renderArea.height;
+  state->input.windowSize[0] = state->renderArea.width;
+  state->input.windowSize[1] = state->renderArea.height;
 
   // Buttons
   uint32_t mouseButtons =
       (glfwGetMouseButton(state->window, GLFW_MOUSE_BUTTON_LEFT) << 1) |
       glfwGetMouseButton(state->window, GLFW_MOUSE_BUTTON_RIGHT);
-  if (mouseButtons != state->input->mouseButtons) {
-    state->input->mouseButtons = mouseButtons;
+  if (mouseButtons != state->input.mouseButtons) {
+    state->input.mouseButtons = mouseButtons;
   }
 
   // Cursor
   double xpos, ypos;
   glfwGetCursorPos(state->window, &xpos, &ypos);
-  if (state->input->mouse[0] != xpos || state->input->mouse[1] != ypos) {
+  if (state->input.mouse[0] != xpos || state->input.mouse[1] != ypos) {
+    state->input.mouse[0] = xpos;
+    state->input.mouse[1] = ypos;
   }
-  state->input->mouse[0] = xpos;
-  state->input->mouse[1] = ypos;
   InputOutputBuffer *buf = NULL;
-  vkMapMemory(state->device, state->input->inputOutputMemory,
-              (state->imageId + 1) % (state->imageCount + 1),
-              sizeof(InputOutputBuffer), 0, (void *)buf);
-	memcpy(state->input->worldMouse, buf->worldMouse, sizeof(vec4));
-	vkUnmapMemory(state->device, state->input->inputOutputMemory);
+  vkMapMemory(state->device, state->input.inputOutputMemory,
+              sizeof(InputOutputBuffer) *
+                  ((state->imageId + 1) % state->imageCount),
+              sizeof(InputOutputBuffer), 0, (void **)&buf);
+  memcpy(state->input.worldMouse, buf->worldMouse, sizeof(vec4));
+  vkUnmapMemory(state->device, state->input.inputOutputMemory);
 
   // Box drag start
-  if ((state->input->mouseButtons & 2) == 0) {
-    state->input->mouse[2] = state->input->mouse[0];
-    state->input->mouse[3] = state->input->mouse[1];
+  if ((state->input.mouseButtons & 2) == 0) {
+    state->input.mouse[2] = state->input.mouse[0];
+    state->input.mouse[3] = state->input.mouse[1];
   }
+  state->input.mappedIIB->mouseButtons = state->input.mouseButtons;
+  memcpy(state->input.mappedIIB->mouse, state->input.mouse, sizeof(vec4));
 }
 
 void UpdateDescriptors(GraphicsState *state) {
   VkWriteDescriptorSet vwds[MAX_SWAPCHAIN_IMAGES * 3];
+
+  // == UNIFORM BUFFERS
   for (uint32_t i = 0; i < state->imageCount; i++) {
-    uint32_t elementStart = i * 3;
-    // BINDING 0 - CAMERA UNIFORM
-    vwds[elementStart] = (VkWriteDescriptorSet){
+    vwds[i] = (VkWriteDescriptorSet){
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
         .dstSet = state->descriptorSets[i],
         .dstArrayElement = 0,
@@ -387,21 +395,24 @@ void UpdateDescriptors(GraphicsState *state) {
         .pBufferInfo = &(VkDescriptorBufferInfo){.buffer = state->cameraBuffer,
                                                  .offset = 0,
                                                  .range = sizeof(CameraState)}};
-    // BINDING 1 - INPUT SSBO (TODO: MERGE WITH CAMERA UNIFORM PROBABLY)
-    vwds[elementStart + 1] = (VkWriteDescriptorSet){
+  }
+  vkUpdateDescriptorSets(state->device, state->imageCount, vwds, 0,
+                         VK_NULL_HANDLE);
+
+  // == STORAGE BUFFERS
+  for (uint32_t i = 0; i < state->imageCount; i++) {
+    vwds[i * 2] = (VkWriteDescriptorSet){
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
         .dstSet = state->descriptorSets[i],
         .dstArrayElement = 0,
         .descriptorCount = 1,
         .dstBinding = 1,
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .pBufferInfo = &(VkDescriptorBufferInfo){.buffer = state->inputBuffer,
-                                                 .offset = 0,
-                                                 .range = sizeof(InputState)}};
-    // BINDING 2 - TEXTURE BUFFER
-    // Updated lazily during texture upload
-    // BINDING 3 - INPUT OUTPUT SSBO
-    vwds[elementStart + 2] = (VkWriteDescriptorSet){
+        .pBufferInfo =
+            &(VkDescriptorBufferInfo){.buffer = state->input.inputInputBuffer,
+                                      .offset = 0,
+                                      .range = sizeof(InputInputBuffer)}};
+    vwds[i * 2 + 1] = (VkWriteDescriptorSet){
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
         .dstSet = state->descriptorSets[i],
         .dstArrayElement = 0,
@@ -409,11 +420,14 @@ void UpdateDescriptors(GraphicsState *state) {
         .dstBinding = 3,
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
         .pBufferInfo = &(VkDescriptorBufferInfo){
-            .buffer = state->input->inputOutputBuffers[i],
+            .buffer = state->input.inputOutputBuffers[i],
             .offset = 0,
             .range = sizeof(InputOutputBuffer)}};
   }
+  vkUpdateDescriptorSets(state->device, state->imageCount * 2, vwds, 0,
+                         VK_NULL_HANDLE);
 
+  // == TEXTURES
   if (state->textureCount > 0) {
     VkDescriptorImageInfo vdif[state->textureCount];
     for (uint32_t t = 0; t < state->textureCount; t++) {
@@ -422,8 +436,6 @@ void UpdateDescriptors(GraphicsState *state) {
           .imageView = state->textures[t]->view,
           .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     }
-    vkUpdateDescriptorSets(state->device, state->imageCount * 2, vwds, 0,
-                           VK_NULL_HANDLE);
     VkWriteDescriptorSet vwds[MAX_SWAPCHAIN_IMAGES];
     for (uint32_t i = 0; i < state->imageCount; i++) {
       vwds[i] = (VkWriteDescriptorSet){
@@ -435,8 +447,9 @@ void UpdateDescriptors(GraphicsState *state) {
           .dstSet = state->descriptorSets[i],
           .pImageInfo = vdif};
     }
-    vkUpdateDescriptorSets(state->device, state->imageCount, vwds, 0,
+    /*vkUpdateDescriptorSets(state->device, state->imageCount, vwds, 0,
                            VK_NULL_HANDLE);
+													 */
   }
 }
 // TODO: Something wrong with sizing here, vulkan allocates a texture image of
@@ -534,10 +547,10 @@ uint32_t OpenTexture(GraphicsState *state, Texture *texture, char *filename) {
       NULL, 0, NULL, 1,
       &(VkImageMemoryBarrier){
           .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-          .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-          .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+          .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+          .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
           .image = texture->image,
-          .subresourceRange = {.baseMipLevel = 1,
+          .subresourceRange = {.baseMipLevel = 0,
                                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
                                .layerCount = 1,
                                .baseArrayLayer = 0,
@@ -545,7 +558,8 @@ uint32_t OpenTexture(GraphicsState *state, Texture *texture, char *filename) {
           .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
           .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT});
   vkCmdCopyBufferToImage(
-      cb, state->stagingBuffer, texture->image, VK_IMAGE_LAYOUT_GENERAL, 1,
+      cb, state->stagingBuffer, texture->image,
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
       &(VkBufferImageCopy){
           .bufferOffset = 0,
           .bufferRowLength = texture->width,
@@ -593,8 +607,8 @@ uint32_t OpenTexture(GraphicsState *state, Texture *texture, char *filename) {
                             mipHeight > 1 ? mipHeight / 2 : 1, 1}}},
         VK_FILTER_LINEAR);
     vkCmdPipelineBarrier(
-        cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-        0, NULL, 0, NULL, 1,
+        cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1,
         &(VkImageMemoryBarrier){
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .subresourceRange = {.baseMipLevel = t - 1,
@@ -602,7 +616,7 @@ uint32_t OpenTexture(GraphicsState *state, Texture *texture, char *filename) {
                                  .layerCount = 1,
                                  .baseArrayLayer = 0,
                                  .levelCount = 1},
-            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             .image = texture->image,
             .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
@@ -612,8 +626,8 @@ uint32_t OpenTexture(GraphicsState *state, Texture *texture, char *filename) {
     mipHeight /= 2;
   }
   vkCmdPipelineBarrier(
-      cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
-      NULL, 0, NULL, 1,
+      cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+      0, 0, NULL, 0, NULL, 1,
       &(VkImageMemoryBarrier){
           .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
           .subresourceRange = {.baseMipLevel = mipLevels - 1,
@@ -875,17 +889,15 @@ void SetupDescriptorSets(GraphicsState *state) {
       &(VkDescriptorPoolCreateInfo){
           .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
           .maxSets = MAX_SWAPCHAIN_IMAGES,
-          .poolSizeCount = 4,
+          .poolSizeCount = 3,
           .pPoolSizes =
-              (VkDescriptorPoolSize[4]){
+              (VkDescriptorPoolSize[3]){
                   {.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
                    .descriptorCount = MAX_SWAPCHAIN_IMAGES},
                   {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                   .descriptorCount = MAX_SWAPCHAIN_IMAGES},
+                   .descriptorCount = MAX_SWAPCHAIN_IMAGES * 2},
                   {.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                   .descriptorCount = 512 * MAX_SWAPCHAIN_IMAGES},
-                  {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                   .descriptorCount = MAX_SWAPCHAIN_IMAGES}}},
+                   .descriptorCount = 512 * MAX_SWAPCHAIN_IMAGES}}},
       NULL, &state->descriptorPool);
   vkAllocateDescriptorSets(
       state->device,
@@ -893,10 +905,13 @@ void SetupDescriptorSets(GraphicsState *state) {
           .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
           .descriptorPool = state->descriptorPool,
           .descriptorSetCount = state->imageCount,
-          .pSetLayouts =
-              (VkDescriptorSetLayout[MAX_SWAPCHAIN_IMAGES]){
-                  state->descriptorSetLayout, state->descriptorSetLayout,
-                  state->descriptorSetLayout}},
+          .pSetLayouts = // TODO: Just cram 8 in, which will be the max we can
+                         // use
+          (VkDescriptorSetLayout[MAX_SWAPCHAIN_IMAGES]){
+              state->descriptorSetLayout, state->descriptorSetLayout,
+              state->descriptorSetLayout, state->descriptorSetLayout,
+              state->descriptorSetLayout, state->descriptorSetLayout,
+              state->descriptorSetLayout, state->descriptorSetLayout}},
       state->descriptorSets);
 
   UpdateDescriptors(state);
@@ -1411,81 +1426,28 @@ GraphicsState InitGraphics() {
                VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                    VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                1, &state.cameraBuffer, &state.cameraMemory);
-  CreateBuffer(device, physicalDevice, sizeof(InputState),
+  vkMapMemory(device, state.cameraMemory, 0, sizeof(CameraState), 0,
+              (void **)&state.camera);
+  CreateBuffer(device, physicalDevice, sizeof(InputInputBuffer),
                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-               1, &state.inputBuffer, &state.inputMemory);
-  CreateBuffer(state.device, state.physicalDevice, sizeof(InputOutputBuffer),
+               1, &state.input.inputInputBuffer, &state.input.inputInputMemory);
+  vkMapMemory(device, state.input.inputInputMemory, 0, sizeof(InputInputBuffer),
+              0, (void **)&state.input.mappedIIB);
+  CreateBuffer(device, physicalDevice, sizeof(InputOutputBuffer),
                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
-                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
-               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, state.imageCount,
-               state.input->inputOutputBuffers,
-               &state.input->inputOutputMemory);
+                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+               VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+               MAX_SWAPCHAIN_IMAGES, state.input.inputOutputBuffers,
+               &state.input.inputOutputMemory);
 
   glm_mat4_identity_array(&state.camera->mvp, 4);
   glm_translate(state.camera->view, (vec3){0, 0, 0});
   CreateRenderState(&state);
   return state;
-}
-
-void ReadInputData(GraphicsState *state) {
-  if (!state->inputReadCommandBuffer) {
-    CreateBuffer(state->device, state->physicalDevice, sizeof(InputState),
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
-                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                     VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                 1, &state->stagingInputBuffer, &state->stagingInputMemory);
-    vkCreateFence(
-        state->device,
-        &(VkFenceCreateInfo){.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO},
-        NULL, &state->inputReadFence);
-    vkAllocateCommandBuffers(
-        state->device,
-        &(VkCommandBufferAllocateInfo){
-            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-            .commandPool = state->commandPool,
-            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-            .commandBufferCount = 1},
-        &state->entitySyncCommandBuffer);
-
-    vkBeginCommandBuffer(
-        state->inputReadCommandBuffer,
-        &(VkCommandBufferBeginInfo){
-            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO});
-    vkCmdCopyBuffer(state->inputReadCommandBuffer, state->inputBuffer,
-                    state->stagingInputBuffer, 1,
-                    &(VkBufferCopy){.srcOffset = 0,
-                                    .dstOffset = 0,
-                                    .size = sizeof(InputState)});
-    vkEndCommandBuffer(state->inputReadCommandBuffer);
-  }
-
-  VkQueue queue;
-  vkGetDeviceQueue(
-      state->device,
-      getQueuesMatching(state->physicalDevice, VK_QUEUE_TRANSFER_BIT, 0)[0], 0,
-      &queue);
-  vkQueueSubmit(
-      queue, 1,
-      &(VkSubmitInfo){.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                      .commandBufferCount = 1,
-                      .pCommandBuffers = &state->inputReadCommandBuffer},
-      state->inputReadFence);
-  uint32_t res =
-      vkWaitForFences(state->device, 1, &state->inputReadFence, 1, 1000000);
-  if (res == VK_TIMEOUT) {
-    printf("Input data timeout\n");
-  }
-  vkResetFences(state->device, 1, &state->inputReadFence);
-  InputState *dat;
-  vkMapMemory(state->device, state->stagingInputMemory, 0, sizeof(InputState),
-              0, (void **)&dat);
-  memcpy(&state->input, dat, sizeof(InputState));
-  vkUnmapMemory(state->device, state->stagingInputMemory);
 }
 
 void MoveCamera(GraphicsState *state) {
@@ -1549,7 +1511,7 @@ void DrawGraphics(GraphicsState *state) {
   }
 
   // Determine frame id
-  uint32_t image_index = (state->imageId + 1) % (state->imageCount + 1);
+  uint32_t image_index = (state->imageId + 1) % state->imageCount;
   uint32_t imageId;
   VkResult result = vkAcquireNextImageKHR(
       state->device, state->swapchain, 1e8,
