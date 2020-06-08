@@ -1,48 +1,51 @@
 #include "engine.h"
+#include <GLFW/glfw3.h>
+#include <cglm/affine-mat.h>
 #include <cglm/mat4.h>
 #include <cglm/vec3.h>
 #define STB_PERLIN_IMPLEMENTATION
 #include "stb_perlin.h"
+
+typedef struct Unit {
+  vec3 target;
+  Instance *instance;
+} Unit;
+
+void updateUnit(Unit *unit, InputState *state) {
+  if (state->mouseButtons & 2) {
+    unit->target[0] = state->worldMouse[0];
+    unit->target[1] = state->worldMouse[1];
+    unit->target[2] = state->worldMouse[2];
+  }
+  if (unit->target[0] == 0 && unit->target[1] == 0 && unit->target[2] == 0) {
+    unit->target[0] = unit->instance->position[0];
+    unit->target[1] = unit->instance->position[1];
+    unit->target[2] = unit->instance->position[2];
+  }
+  vec3 vel;
+  glm_vec3_sub(unit->target, unit->instance->position, vel);
+  glm_normalize(vel);
+  glm_vec3_mul(vel, (vec3){0.002, 0.002, 0.002}, vel);
+  glm_vec3_add(unit->instance->position, vel, unit->instance->position);
+  unit->instance->position[1] =
+      stb_perlin_fbm_noise3(unit->instance->position[0] / 512.f, 0,
+                            unit->instance->position[2] / 512.f, 2.3, 0.3, 6) *
+      100;
+  *unit->instance->dirty = true;
+}
+
 int main(int argc, char **argv) {
   glfwInit();
   GraphicsState graphics = InitGraphics();
-  Texture grassTexture, standardTexture, dirtTexture, albedoTexture;
+  Texture grassTexture, standardTexture, dirtTexture, albedoTexture,
+      waterTexture, treeTexture;
   OpenTexture(&graphics, &grassTexture, "data/textures/grass.png");
   OpenTexture(&graphics, &dirtTexture, "data/textures/dirt.png");
   OpenTexture(&graphics, &standardTexture, "data/textures/standard.png");
   OpenTexture(&graphics, &albedoTexture, "data/textures/albedo.png");
-  Model water = (Model){};
-  water.vertices = (Vertex[6]){{.position = {0, 0, 0},
-                                .color = {0, 0, 1, 0.8},
-                                .normal = {0, 1, 0},
-                                .uvcoords = {0, 0}},
-                               {.position = {1, 0, 0},
-                                .color = {0, 0, 1, 0.8},
-                                .normal = {0, 1, 0},
-                                .uvcoords = {0, 0}},
-                               {.position = {0, 1, 0},
-                                .color = {0, 0, 1, 0.8},
-                                .normal = {0, 1, 0},
-                                .uvcoords = {0, 0}},
-                               {.position = {1, 0, 0},
-                                .color = {0, 0, 1, 0.8},
-                                .normal = {0, 1, 0},
-                                .uvcoords = {0, 0}},
-                               {.position = {0, 1, 0},
-                                .color = {0, 0, 1, 0.8},
-                                .normal = {0, 1, 0},
-                                .uvcoords = {0, 0}},
-                               {.position = {1, 1, 0},
-                                .color = {0, 0, 1, 0.8},
-                                .normal = {0, 1, 0},
-                                .uvcoords = {0, 0}}};
-  uint32_t waterDef = CreateEntityDef(&graphics, &water);
-  Instance waterInstance = {.position = {0, 0, 0},
-                            .scale = {512, 512, 1},
-                            .textureId1 = albedoTexture.textureId,
-                            .textureId2 = albedoTexture.textureId};
-  glm_mat4_identity(waterInstance.rotation);
-  AddEntityInstance(&graphics.entities[waterDef], waterInstance);
+  OpenTexture(&graphics, &waterTexture, "data/textures/blue_transparent.png");
+  OpenTexture(&graphics, &treeTexture, "data/textures/tree.png");
+  // == TERRAIN
   Model terrain = (Model){};
   terrain.vertices =
       malloc(sizeof(Vertex) * 512 * 512 *
@@ -129,6 +132,205 @@ int main(int argc, char **argv) {
                               .textureId2 = dirtTexture.textureId};
   glm_mat4_identity(terrainInstance.rotation);
   AddEntityInstance(&graphics.entities[terrainDef], terrainInstance);
+  // == WATER
+  Model water = (Model){.vertexCount = 6,
+                        .vertices = (Vertex[6]){{.position = {0, 0, 0},
+                                                 .color = {1, 1, 1, 1},
+                                                 .normal = {0, 1, 0},
+                                                 .uvcoords = {0, 0}},
+                                                {.position = {0, 0, 1},
+                                                 .color = {1, 1, 1, 1},
+                                                 .normal = {0, 1, 0},
+                                                 .uvcoords = {0, 0}},
+                                                {.position = {1, 0, 0},
+                                                 .color = {1, 1, 1, 1},
+                                                 .normal = {0, 1, 0},
+                                                 .uvcoords = {0, 0}},
+                                                {.position = {1, 0, 0},
+                                                 .color = {1, 1, 1, 1},
+                                                 .normal = {0, 1, 0},
+                                                 .uvcoords = {0, 0}},
+                                                {.position = {0, 0, 1},
+                                                 .color = {1, 1, 1, 1},
+                                                 .normal = {0, 1, 0},
+                                                 .uvcoords = {0, 0}},
+                                                {.position = {1, 0, 1},
+                                                 .color = {1, 1, 1, 1},
+                                                 .normal = {0, 1, 0},
+                                                 .uvcoords = {0, 0}}}};
+  uint32_t waterDef = CreateEntityDef(&graphics, &water);
+  Instance waterInstance = {.position = {0, 0, 0},
+                            .scale = {512, 1, 512},
+                            .textureId1 = waterTexture.textureId,
+                            .textureId2 = waterTexture.textureId};
+  glm_mat4_identity(waterInstance.rotation);
+  AddEntityInstance(&graphics.entities[waterDef], waterInstance);
+  // == TREE
+  Model tree = (Model){};
+  tree.vertexCount = 24;
+  tree.vertices = (Vertex[24]){
+      {.position = {-1, 0, 0},
+       .uvcoords = {0, 1},
+       .color = {1, 1, 1, 1},
+       .normal = {0, 0, 1}},
+      {.position = {-1, 2, 0},
+       .uvcoords = {0, 0},
+       .color = {1, 1, 1, 1},
+       .normal = {0, 0, 1}},
+      {.position = {1, 0, 0},
+       .uvcoords = {1, 1},
+       .color = {1, 1, 1, 1},
+       .normal = {0, 0, 1}},
+      {.position = {-1, 2, 0},
+       .uvcoords = {0, 0},
+       .color = {1, 1, 1, 1},
+       .normal = {0, 0, 1}},
+      {.position = {1, 2, 0},
+       .uvcoords = {1, 0},
+       .color = {1, 1, 1, 1},
+       .normal = {0, 0, 1}},
+      {.position = {1, 0, 0},
+       .uvcoords = {1, 1},
+       .color = {1, 1, 1, 1},
+       .normal = {0, 0, 1}},
+      {.position = {-1, 2, 0},
+       .uvcoords = {0, 0},
+       .color = {1, 1, 1, 1},
+       .normal = {0, 0, 1}},
+      {.position = {-1, 0, 0},
+       .uvcoords = {0, 1},
+       .color = {1, 1, 1, 1},
+       .normal = {0, 0, 1}},
+      {.position = {1, 0, 0},
+       .uvcoords = {1, 1},
+       .color = {1, 1, 1, 1},
+       .normal = {0, 0, 1}},
+      {.position = {1, 2, 0},
+       .uvcoords = {1, 0},
+       .color = {1, 1, 1, 1},
+       .normal = {0, 0, 1}},
+      {.position = {-1, 2, 0},
+       .uvcoords = {0, 0},
+       .color = {1, 1, 1, 1},
+       .normal = {0, 0, 1}},
+      {.position = {1, 0, 0},
+       .uvcoords = {1, 1},
+       .color = {1, 1, 1, 1},
+       .normal = {0, 0, 1}},
+      {.position = {0, 0, -1},
+       .uvcoords = {0, 1},
+       .color = {1, 1, 1, 1},
+       .normal = {0, 0, 1}},
+      {.position = {0, 2, -1},
+       .uvcoords = {0, 0},
+       .color = {1, 1, 1, 1},
+       .normal = {0, 0, 1}},
+      {.position = {0, 0, 1},
+       .uvcoords = {1, 1},
+       .color = {1, 1, 1, 1},
+       .normal = {0, 0, 1}},
+      {.position = {0, 2, -1},
+       .uvcoords = {0, 0},
+       .color = {1, 1, 1, 1},
+       .normal = {0, 0, 1}},
+      {.position = {0, 2, 1},
+       .uvcoords = {1, 0},
+       .color = {1, 1, 1, 1},
+       .normal = {0, 0, 1}},
+      {.position = {0, 0, 1},
+       .uvcoords = {1, 1},
+       .color = {1, 1, 1, 1},
+       .normal = {0, 0, 1}},
+      {.position = {0, 2, -1},
+       .uvcoords = {0, 0},
+       .color = {1, 1, 1, 1},
+       .normal = {0, 0, 1}},
+      {.position = {0, 0, -1},
+       .uvcoords = {0, 1},
+       .color = {1, 1, 1, 1},
+       .normal = {0, 0, 1}},
+      {.position = {0, 0, 1},
+       .uvcoords = {1, 1},
+       .color = {1, 1, 1, 1},
+       .normal = {0, 0, 1}},
+      {.position = {0, 2, 1},
+       .uvcoords = {1, 0},
+       .color = {1, 1, 1, 1},
+       .normal = {0, 0, 1}},
+      {.position = {0, 2, -1},
+       .uvcoords = {0, 0},
+       .color = {1, 1, 1, 1},
+       .normal = {0, 0, 1}},
+      {.position = {0, 0, 1},
+       .uvcoords = {1, 1},
+       .color = {1, 1, 1, 1},
+       .normal = {0, 0, 1}},
+  };
+  uint32_t treeDef = CreateEntityDef(&graphics, &tree);
+  for (uint32_t t = 0; t < 1024; t++) {
+    vec3 pos;
+    while (1) {
+      pos[0] = (float)(rand() % (512 * 512)) / 512;
+      pos[2] = (float)(rand() % (512 * 512)) / 512;
+      pos[1] =
+          stb_perlin_fbm_noise3(pos[0] / 512, 0, pos[2] / 512, 2.3, 0.3, 6) *
+          100;
+      if (pos[1] > 0) {
+        break;
+      }
+    }
+    Instance treeInstance = {
+        .position = {pos[0], pos[1], pos[2]},
+        .scale = {0.4, 1, 0.4},
+        .textureId1 = treeTexture.textureId,
+        .textureId2 = treeTexture.textureId,
+    };
+    glm_mat4_identity(treeInstance.rotation);
+    AddEntityInstance(&graphics.entities[treeDef], treeInstance);
+  }
+  // == STANDARD
+  Model standard = (Model){.vertexCount = 6,
+                           .vertices = (Vertex[6]){{.position = {-0.5, 0, 0},
+                                                    .color = {1, 1, 1, 1},
+                                                    .normal = {0, 1, 0},
+                                                    .uvcoords = {0, 1}},
+                                                   {.position = {-0.5, 1, 0},
+                                                    .color = {1, 1, 1, 1},
+                                                    .normal = {0, 1, 0},
+                                                    .uvcoords = {0, 0}},
+                                                   {.position = {0.5, 1, 0},
+                                                    .color = {1, 1, 1, 1},
+                                                    .normal = {0, 1, 0},
+                                                    .uvcoords = {1, 0}},
+                                                   {.position = {0.5, 0, 0},
+                                                    .color = {1, 1, 1, 1},
+                                                    .normal = {0, 1, 0},
+                                                    .uvcoords = {1, 1}},
+                                                   {.position = {-0.5, 0, 0},
+                                                    .color = {1, 1, 1, 1},
+                                                    .normal = {0, 1, 0},
+                                                    .uvcoords = {0, 1}},
+                                                   {.position = {0.5, 1, 0},
+                                                    .color = {1, 1, 1, 1},
+                                                    .normal = {0, 1, 0},
+                                                    .uvcoords = {1, 0}}}};
+  uint32_t standardDef = CreateEntityDef(&graphics, &standard);
+  Instance standardInstance = {
+      .position = {200,
+                   stb_perlin_fbm_noise3(200.f / 512.f, 0, 100.f / 512.f, 2.3,
+                                         0.3, 6) *
+                       100,
+                   // 0,
+                   100},
+      .scale = {0.01 * standardTexture.width, 0.01 * standardTexture.height, 1},
+      .textureId1 = standardTexture.textureId,
+      .textureId2 = standardTexture.textureId};
+  glm_mat4_identity(standardInstance.rotation);
+  uint32_t standardId =
+      AddEntityInstance(&graphics.entities[standardDef], standardInstance);
+
+  Unit standardUnit = {
+      .instance = &graphics.entities[standardDef].instances[standardId]};
 
   while (true) {
     if (glfwWindowShouldClose(graphics.window)) {
@@ -136,6 +338,7 @@ int main(int argc, char **argv) {
     }
     glfwPollEvents();
     MoveCamera(&graphics);
+    updateUnit(&standardUnit, graphics.input);
     DrawGraphics(&graphics);
   }
 }

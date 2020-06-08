@@ -1,5 +1,5 @@
 #!/bin/bash
-while inotifywait -r -e modify,create,delete,move .; do
+while inotifywait -r -e modify,create,delete,move ./src/ ./shaders/; do
 	glslangValidator -V shaders/vertex.vert -o shaders/vertex.spv
 	glslangValidator -V shaders/fragment.frag -o shaders/fragment.spv
 	cd build; ninja; cd ..

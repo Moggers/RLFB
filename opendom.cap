@@ -7,7 +7,7 @@
         ],
         "executable": "/home/matthew/git/opendom/build/main",
         "inject": false,
-        "numQueuedFrames": 10,
+        "numQueuedFrames": 0,
         "options": {
             "allowFullscreen": true,
             "allowVSync": true,

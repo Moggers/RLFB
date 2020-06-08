@@ -1,4 +1,6 @@
+#include <cglm/affine.h>
 #include <cglm/cglm.h>
+#include <cglm/mat4.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -23,7 +25,6 @@ typedef struct Vertex {
 typedef struct Model {
   Vertex *vertices;
   uint32_t vertexCount;
-  char *materialPath;
   VkBuffer vertexBuffer;
   VkDeviceMemory vertexMemory;
 } Model;
@@ -48,6 +49,9 @@ typedef struct Instance {
   bool selected;
   uint32_t textureId1;
   uint32_t textureId2;
+  uint32_t billboard;
+  // NOT SENT TO GPU!!!! CPU HELPER _ONLY_!!!!
+  bool *dirty;
 } Instance;
 
 typedef struct EntityDef {
@@ -113,24 +117,31 @@ Model loadFromFile(char *path) {
 #define MAX_SWAPCHAIN_IMAGES 8
 
 typedef struct CameraState {
-  // Loaded onto GPU
-  mat4 model;
+  mat4 mvp;
   mat4 view;
+  mat4 model;
   mat4 proj;
-  // Doesn't go to GPU
   vec3 cameraVelocity;
   bool cameraTurning; // True = Holding down camera turn modifier
 } CameraState;
 
+typedef struct InputOutputBuffer {
+  uint32_t selectionBufferLength;
+  uint32_t selectionBuffer[256];
+  char selectionMap[65536];
+  int worldMouseDepth;
+  vec4 worldMouse;
+} InputOutputBuffer;
+
 typedef struct InputState {
+  // Sent to GPU
   vec4 mouse;
   vec2 windowSize;
   uint32_t mouseButtons;
-  uint32_t selectionBufferLength;
-  uint32_t frameId; // Rolling frame timestamp for determining how recently a
-                    // selection occurred
-  char selectionMap[4096];
-  char selectionBuffer[256];
+  // CPU only
+  vec4 worldMouse; // Copied from GPU
+  VkBuffer inputOutputBuffers[MAX_SWAPCHAIN_IMAGES];
+  VkDeviceMemory inputOutputMemory;
 } InputState;
 
 typedef struct GraphicsState {
@@ -250,7 +261,9 @@ void SetupCommandBuffer(GraphicsState *state, int frameNumber,
                                          .depth = 1.,
                                      }}}},
       VK_SUBPASS_CONTENTS_INLINE);
-  VkImageMemoryBarrier imageBarriers[state->imageCount];
+  vkCmdFillBuffer(state->commandbuffers[frameNumber],
+                  state->input->inputOutputBuffers[frameNumber], 0,
+                  sizeof(InputOutputBuffer), 0);
   vkCmdBindDescriptorSets(state->commandbuffers[frameNumber],
                           VK_PIPELINE_BIND_POINT_GRAPHICS, state->layout, 0, 1,
                           &state->descriptorSets[frameNumber], 0,
@@ -292,8 +305,8 @@ VkShaderModule LoadShaderFromFile(VkDevice device, char *filepath) {
 
 void CreateBuffer(VkDevice device, VkPhysicalDevice physical, size_t size,
                   VkMemoryPropertyFlagBits memoryFlags,
-                  VkBufferUsageFlagBits usageFlags, VkBuffer *buffer,
-                  VkDeviceMemory *memory) {
+                  VkBufferUsageFlagBits usageFlags, uint32_t bufferCount,
+                  VkBuffer *buffer, VkDeviceMemory *memory) {
   VkPhysicalDeviceMemoryProperties properties;
   vkGetPhysicalDeviceMemoryProperties(physical, &properties);
   uint32_t memoryIndex = 0;
@@ -307,31 +320,28 @@ void CreateBuffer(VkDevice device, VkPhysicalDevice physical, size_t size,
   vkAllocateMemory(
       device,
       &(VkMemoryAllocateInfo){.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-                              .allocationSize = size,
+                              .allocationSize = size * bufferCount,
                               .memoryTypeIndex = memoryIndex},
       NULL, memory);
-  vkCreateBuffer(device,
-                 &(VkBufferCreateInfo){
-                     .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                     .size = size,
-                     .usage = usageFlags,
-                     .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                     .queueFamilyIndexCount = 1,
-                     .pQueueFamilyIndices =
-                         getQueuesMatching(physical, VK_QUEUE_TRANSFER_BIT, 0)},
-                 NULL, buffer);
-  vkBindBufferMemory(device, *buffer, *memory, 0);
+  for (uint32_t t = 0; t < bufferCount; t++) {
+    vkCreateBuffer(
+        device,
+        &(VkBufferCreateInfo){.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                              .size = size,
+                              .usage = usageFlags,
+                              .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                              .queueFamilyIndexCount = 1,
+                              .pQueueFamilyIndices = getQueuesMatching(
+                                  physical, VK_QUEUE_TRANSFER_BIT, 0)},
+        NULL, buffer);
+    vkBindBufferMemory(device, *buffer, *memory, size * t);
+  }
 }
 
 void UpdateInputState(GraphicsState *state) {
 
   state->input->windowSize[0] = state->renderArea.width;
   state->input->windowSize[1] = state->renderArea.height;
-  if (state->input->frameId == 15) {
-    state->input->frameId = 1;
-  } else {
-    state->input->frameId++;
-  }
 
   // Buttons
   uint32_t mouseButtons =
@@ -348,6 +358,12 @@ void UpdateInputState(GraphicsState *state) {
   }
   state->input->mouse[0] = xpos;
   state->input->mouse[1] = ypos;
+  InputOutputBuffer *buf = NULL;
+  vkMapMemory(state->device, state->input->inputOutputMemory,
+              (state->imageId + 1) % (state->imageCount + 1),
+              sizeof(InputOutputBuffer), 0, (void *)buf);
+	memcpy(state->input->worldMouse, buf->worldMouse, sizeof(vec4));
+	vkUnmapMemory(state->device, state->input->inputOutputMemory);
 
   // Box drag start
   if ((state->input->mouseButtons & 2) == 0) {
@@ -357,9 +373,10 @@ void UpdateInputState(GraphicsState *state) {
 }
 
 void UpdateDescriptors(GraphicsState *state) {
-  VkWriteDescriptorSet vwds[MAX_SWAPCHAIN_IMAGES * 2];
+  VkWriteDescriptorSet vwds[MAX_SWAPCHAIN_IMAGES * 3];
   for (uint32_t i = 0; i < state->imageCount; i++) {
-    uint32_t elementStart = i * 2;
+    uint32_t elementStart = i * 3;
+    // BINDING 0 - CAMERA UNIFORM
     vwds[elementStart] = (VkWriteDescriptorSet){
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
         .dstSet = state->descriptorSets[i],
@@ -367,10 +384,10 @@ void UpdateDescriptors(GraphicsState *state) {
         .descriptorCount = 1,
         .dstBinding = 0,
         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        .pBufferInfo =
-            (VkDescriptorBufferInfo[1]){{.buffer = state->cameraBuffer,
-                                         .offset = 0,
-                                         .range = sizeof(CameraState)}}};
+        .pBufferInfo = &(VkDescriptorBufferInfo){.buffer = state->cameraBuffer,
+                                                 .offset = 0,
+                                                 .range = sizeof(CameraState)}};
+    // BINDING 1 - INPUT SSBO (TODO: MERGE WITH CAMERA UNIFORM PROBABLY)
     vwds[elementStart + 1] = (VkWriteDescriptorSet){
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
         .dstSet = state->descriptorSets[i],
@@ -378,10 +395,23 @@ void UpdateDescriptors(GraphicsState *state) {
         .descriptorCount = 1,
         .dstBinding = 1,
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .pBufferInfo =
-            (VkDescriptorBufferInfo[1]){{.buffer = state->inputBuffer,
-                                         .offset = 0,
-                                         .range = sizeof(InputState)}}};
+        .pBufferInfo = &(VkDescriptorBufferInfo){.buffer = state->inputBuffer,
+                                                 .offset = 0,
+                                                 .range = sizeof(InputState)}};
+    // BINDING 2 - TEXTURE BUFFER
+    // Updated lazily during texture upload
+    // BINDING 3 - INPUT OUTPUT SSBO
+    vwds[elementStart + 2] = (VkWriteDescriptorSet){
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = state->descriptorSets[i],
+        .dstArrayElement = 0,
+        .descriptorCount = 1,
+        .dstBinding = 3,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .pBufferInfo = &(VkDescriptorBufferInfo){
+            .buffer = state->input->inputOutputBuffers[i],
+            .offset = 0,
+            .range = sizeof(InputOutputBuffer)}};
   }
 
   if (state->textureCount > 0) {
@@ -424,7 +454,7 @@ uint32_t OpenTexture(GraphicsState *state, Texture *texture, char *filename) {
       state->device,
       &(VkImageCreateInfo){.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
                            .imageType = VK_IMAGE_TYPE_2D,
-                           .format = VK_FORMAT_R8G8B8A8_SRGB,
+                           .format = VK_FORMAT_R8G8B8A8_UNORM,
                            .extent = {.width = texture->width,
                                       .height = texture->height,
                                       .depth = 1},
@@ -433,6 +463,7 @@ uint32_t OpenTexture(GraphicsState *state, Texture *texture, char *filename) {
                            .samples = VK_SAMPLE_COUNT_1_BIT,
                            .tiling = VK_IMAGE_TILING_LINEAR,
                            .usage = VK_IMAGE_USAGE_SAMPLED_BIT |
+                                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                                     VK_IMAGE_USAGE_TRANSFER_DST_BIT},
       NULL, &texture->image);
   uint32_t typeCount;
@@ -447,14 +478,15 @@ uint32_t OpenTexture(GraphicsState *state, Texture *texture, char *filename) {
                               .memoryTypeIndex = types[0]},
       NULL, &texture->imageMemory);
   vkBindImageMemory(state->device, texture->image, texture->imageMemory, 0);
-  memcpy((stbi_uc *)state->mappedStagingMemory, texture->tex, texture->width * texture->height * sizeof(char)); 
+  memcpy((stbi_uc *)state->mappedStagingMemory, texture->tex,
+         texture->width * texture->height * 4);
   vkCreateImageView(
       state->device,
       &(VkImageViewCreateInfo){
           .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
           .image = texture->image,
           .viewType = VK_IMAGE_VIEW_TYPE_2D,
-          .format = VK_FORMAT_R8G8B8A8_SRGB,
+          .format = VK_FORMAT_R8G8B8A8_UNORM,
           .components = {.r = VK_COMPONENT_SWIZZLE_R,
                          .g = VK_COMPONENT_SWIZZLE_G,
                          .b = VK_COMPONENT_SWIZZLE_B,
@@ -500,11 +532,18 @@ uint32_t OpenTexture(GraphicsState *state, Texture *texture, char *filename) {
   vkCmdPipelineBarrier(
       cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
       NULL, 0, NULL, 1,
-      &(VkImageMemoryBarrier){.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                              .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                              .image = texture->image,
-                              .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-                              .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT});
+      &(VkImageMemoryBarrier){
+          .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+          .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+          .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+          .image = texture->image,
+          .subresourceRange = {.baseMipLevel = 1,
+                               .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                               .layerCount = 1,
+                               .baseArrayLayer = 0,
+                               .levelCount = VK_REMAINING_MIP_LEVELS},
+          .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+          .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT});
   vkCmdCopyBufferToImage(
       cb, state->stagingBuffer, texture->image, VK_IMAGE_LAYOUT_GENERAL, 1,
       &(VkBufferImageCopy){
@@ -521,18 +560,21 @@ uint32_t OpenTexture(GraphicsState *state, Texture *texture, char *filename) {
   uint32_t mipWidth = texture->width;
   uint32_t mipHeight = texture->height;
   for (uint32_t t = 1; t < mipLevels; t++) {
-    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1,
-                         &(VkImageMemoryBarrier){
-                             .subresourceRange =
-                                 {
-                                     .baseMipLevel = t - 1,
-                                 },
-                             .image = texture->image,
-                             .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                             .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                             .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-                             .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT});
+    vkCmdPipelineBarrier(
+        cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+        0, NULL, 0, NULL, 1,
+        &(VkImageMemoryBarrier){
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .subresourceRange = {.baseMipLevel = t - 1,
+                                 .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                 .layerCount = 1,
+                                 .baseArrayLayer = 0,
+                                 .levelCount = 1},
+            .image = texture->image,
+            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT});
     vkCmdBlitImage(
         cb, texture->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         texture->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
@@ -541,23 +583,25 @@ uint32_t OpenTexture(GraphicsState *state, Texture *texture, char *filename) {
                                .mipLevel = t - 1,
                                .baseArrayLayer = 0,
                                .layerCount = 1},
-            .srcOffsets = {{0, 0, 0}, {mipWidth, mipHeight, 0}},
+            .srcOffsets = {{0, 0, 0}, {mipWidth, mipHeight, 1}},
             .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
                                .mipLevel = t,
                                .baseArrayLayer = 0,
                                .layerCount = 1},
             .dstOffsets = {{0, 0, 0},
                            {mipWidth > 1 ? mipWidth / 2 : 1,
-                            mipHeight > 1 ? mipHeight / 2 : 1, 0}}},
+                            mipHeight > 1 ? mipHeight / 2 : 1, 1}}},
         VK_FILTER_LINEAR);
     vkCmdPipelineBarrier(
         cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
         0, NULL, 0, NULL, 1,
         &(VkImageMemoryBarrier){
-            .subresourceRange =
-                {
-                    .baseMipLevel = t - 1,
-                },
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .subresourceRange = {.baseMipLevel = t - 1,
+                                 .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                 .layerCount = 1,
+                                 .baseArrayLayer = 0,
+                                 .levelCount = 1},
             .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             .image = texture->image,
             .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -570,16 +614,18 @@ uint32_t OpenTexture(GraphicsState *state, Texture *texture, char *filename) {
   vkCmdPipelineBarrier(
       cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
       NULL, 0, NULL, 1,
-      &(VkImageMemoryBarrier){.subresourceRange =
-                                  {
-                                      .baseMipLevel = mipLevels - 1,
-                                  },
-                              .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                              .image = texture->image,
-                              .newLayout =
-                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                              .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-                              .dstAccessMask = VK_ACCESS_SHADER_READ_BIT});
+      &(VkImageMemoryBarrier){
+          .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+          .subresourceRange = {.baseMipLevel = mipLevels - 1,
+                               .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                               .layerCount = 1,
+                               .baseArrayLayer = 0,
+                               .levelCount = 1},
+          .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+          .image = texture->image,
+          .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+          .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+          .dstAccessMask = VK_ACCESS_SHADER_READ_BIT});
   vkEndCommandBuffer(cb);
   VkQueue queue;
   vkGetDeviceQueue(
@@ -632,7 +678,7 @@ uint32_t UploadModel(GraphicsState *state, Model *model) {
   CreateBuffer(
       state->device, state->physicalDevice, model->vertexCount * sizeof(Vertex),
       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-      VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+      VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, 1,
       &model->vertexBuffer, &model->vertexMemory);
   memcpy(state->mappedStagingMemory, model->vertices,
          sizeof(Vertex) * model->vertexCount);
@@ -689,6 +735,7 @@ uint32_t AddEntityInstance(EntityDef *entity, Instance instance) {
     entity->dirtyBuffer =
         realloc(entity->dirtyBuffer, sizeof(Instance) * entity->maxInstances);
   }
+  instance.dirty = &entity->dirtyBuffer[entity->instanceCount];
   entity->instances[entity->instanceCount] = instance;
   entity->dirtyBuffer[entity->instanceCount] = true;
   return entity->instanceCount++;
@@ -748,7 +795,7 @@ uint32_t UpdateGraphicsMemory(GraphicsState *state) {
                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
                    VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                   &def->instanceBuffer, &def->instanceMemory);
+                   1, &def->instanceBuffer, &def->instanceMemory);
     }
     int32_t start = -1;
     for (uint32_t i = 0; i < def->instanceCount; i++) {
@@ -757,7 +804,6 @@ uint32_t UpdateGraphicsMemory(GraphicsState *state) {
       }
       if ((i == (def->instanceCount - 1) || !def->dirtyBuffer[i]) &&
           start != -1) {
-        printf("Length: %lu\n", (i + 1 - start * sizeof(Instance)));
         vkCmdUpdateBuffer(state->entitySyncCommandBuffer, def->instanceBuffer,
                           sizeof(Instance) * start,
                           (i + 1 - start) * sizeof(Instance),
@@ -799,9 +845,9 @@ void SetupDescriptorSets(GraphicsState *state) {
       state->device,
       &(VkDescriptorSetLayoutCreateInfo){
           .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-          .bindingCount = 3,
+          .bindingCount = 4,
           .pBindings =
-              (VkDescriptorSetLayoutBinding[3]){
+              (VkDescriptorSetLayoutBinding[4]){
                   {.binding = 0,
                    .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
                    .descriptorCount = 1,
@@ -817,22 +863,29 @@ void SetupDescriptorSets(GraphicsState *state) {
                    .descriptorCount =
                        16, // TODO: Totally arbitrary, *will* run out soon.
                            // Texture should be swapped in and out
-                   .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT}}},
+                   .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT},
+                  {.binding = 3,
+                   .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                   .descriptorCount = 1,
+                   .stageFlags = VK_SHADER_STAGE_VERTEX_BIT |
+                                 VK_SHADER_STAGE_FRAGMENT_BIT}}},
       NULL, &state->descriptorSetLayout);
   vkCreateDescriptorPool(
       state->device,
       &(VkDescriptorPoolCreateInfo){
           .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
           .maxSets = MAX_SWAPCHAIN_IMAGES,
-          .poolSizeCount = 3,
+          .poolSizeCount = 4,
           .pPoolSizes =
-              (VkDescriptorPoolSize[3]){
+              (VkDescriptorPoolSize[4]){
                   {.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
                    .descriptorCount = MAX_SWAPCHAIN_IMAGES},
                   {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                    .descriptorCount = MAX_SWAPCHAIN_IMAGES},
                   {.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                   .descriptorCount = 512 * MAX_SWAPCHAIN_IMAGES}}},
+                   .descriptorCount = 512 * MAX_SWAPCHAIN_IMAGES},
+                  {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                   .descriptorCount = MAX_SWAPCHAIN_IMAGES}}},
       NULL, &state->descriptorPool);
   vkAllocateDescriptorSets(
       state->device,
@@ -847,6 +900,198 @@ void SetupDescriptorSets(GraphicsState *state) {
       state->descriptorSets);
 
   UpdateDescriptors(state);
+}
+
+void CreateGenericPipeline(GraphicsState *state) {
+  VkSurfaceCapabilitiesKHR capabilites;
+  vkGetPhysicalDeviceSurfaceCapabilitiesKHR(state->physicalDevice,
+                                            state->surface, &capabilites);
+  vkCreatePipelineLayout(
+      state->device,
+      &(VkPipelineLayoutCreateInfo){
+          .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+          .setLayoutCount = 1,
+          .pSetLayouts = (VkDescriptorSetLayout[1]){state->descriptorSetLayout},
+          .pushConstantRangeCount = 0,
+          .pPushConstantRanges = NULL},
+      NULL, &state->layout);
+  vkCreateGraphicsPipelines(
+      state->device, VK_NULL_HANDLE, 1,
+      (VkGraphicsPipelineCreateInfo[1]){
+          {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+           .stageCount = 2,
+           .pStages =
+               (VkPipelineShaderStageCreateInfo[2]){
+                   {.sType =
+                        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                    .stage = VK_SHADER_STAGE_VERTEX_BIT,
+                    .module = LoadShaderFromFile(state->device,
+                                                 "./shaders/vertex.spv"),
+                    .pName = "main"},
+                   {.sType =
+                        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                    .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+                    .module = LoadShaderFromFile(state->device,
+                                                 "./shaders/fragment.spv"),
+                    .pName = "main"}},
+           .pVertexInputState =
+               &(VkPipelineVertexInputStateCreateInfo){
+                   .sType =
+                       VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+                   .vertexBindingDescriptionCount = 2,
+                   .pVertexBindingDescriptions =
+                       (VkVertexInputBindingDescription[2]){
+                           {.binding = 0,
+                            .stride = sizeof(Vertex),
+                            .inputRate = VK_VERTEX_INPUT_RATE_VERTEX},
+                           {.binding = 1,
+                            .stride = sizeof(Instance),
+                            .inputRate = VK_VERTEX_INPUT_RATE_INSTANCE}},
+                   .vertexAttributeDescriptionCount = 15,
+                   .pVertexAttributeDescriptions =
+                       (VkVertexInputAttributeDescription[15]){
+                           {.location = 0,
+                            .binding = 0,
+                            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
+                            .offset = offsetof(Vertex, position)},
+                           {.location = 1,
+                            .binding = 0,
+                            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
+                            .offset = offsetof(Vertex, color)},
+                           {.location = 2,
+                            .binding = 0,
+                            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
+                            .offset = offsetof(Vertex, normal)},
+                           {.location = 3,
+                            .binding = 0,
+                            .format = VK_FORMAT_R32G32_SFLOAT,
+                            .offset = offsetof(Vertex, uvcoords)},
+                           {.location = 4,
+                            .binding = 0,
+                            .format = VK_FORMAT_R32_SFLOAT,
+                            .offset = offsetof(Vertex, blendFactor)},
+                           {.location = 5,
+                            .binding = 1,
+                            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
+                            .offset = offsetof(Instance, rotation[0])},
+                           {.location = 6,
+                            .binding = 1,
+                            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
+                            .offset = offsetof(Instance, rotation[1])},
+                           {.location = 7,
+                            .binding = 1,
+                            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
+                            .offset = offsetof(Instance, rotation[2])},
+                           {.location = 8,
+                            .binding = 1,
+                            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
+                            .offset = offsetof(Instance, rotation[3])},
+                           {.location = 9,
+                            .binding = 1,
+                            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
+                            .offset = offsetof(Instance, position)},
+                           {.location = 10,
+                            .binding = 1,
+                            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
+                            .offset = offsetof(Instance, scale)},
+                           {.location = 11,
+                            .binding = 1,
+                            .format = VK_FORMAT_R32_UINT,
+                            .offset = offsetof(Instance, instanceId)},
+                           {.location = 12,
+                            .binding = 1,
+                            .format = VK_FORMAT_R32_UINT,
+                            .offset = offsetof(Instance, textureId1)},
+                           {.location = 13,
+                            .binding = 1,
+                            .format = VK_FORMAT_R32_UINT,
+                            .offset = offsetof(Instance, textureId2)},
+                           {.location = 14,
+                            .binding = 1,
+                            .format = VK_FORMAT_R32_UINT,
+                            .offset = offsetof(Instance, billboard)}}},
+           .pInputAssemblyState =
+               &(VkPipelineInputAssemblyStateCreateInfo){
+                   .sType =
+                       VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+                   .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST},
+           .pViewportState =
+               &(VkPipelineViewportStateCreateInfo){
+                   .sType =
+                       VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+                   .viewportCount = 1,
+                   .pViewports = &(
+                       VkViewport){.x = 0,
+                                   .y = 0,
+                                   .width = capabilites.maxImageExtent.width,
+                                   .height = capabilites.maxImageExtent.height,
+                                   .minDepth = 0,
+                                   .maxDepth = 1},
+                   .scissorCount = 1,
+                   .pScissors =
+                       &(VkRect2D){.extent = capabilites.maxImageExtent,
+                                   .offset = {0, 0}}},
+           .pRasterizationState =
+               &(VkPipelineRasterizationStateCreateInfo){
+                   .sType =
+                       VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+                   .depthClampEnable = VK_FALSE,
+                   .rasterizerDiscardEnable = VK_FALSE,
+                   .polygonMode = VK_POLYGON_MODE_FILL,
+                   .lineWidth = 1.f,
+                   .cullMode = VK_CULL_MODE_BACK_BIT,
+                   .frontFace = VK_FRONT_FACE_CLOCKWISE},
+           .pMultisampleState =
+               &(VkPipelineMultisampleStateCreateInfo){
+                   .sType =
+                       VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+                   .sampleShadingEnable = VK_FALSE,
+                   .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+                   .minSampleShading = 1.f},
+           .pDepthStencilState =
+               &(VkPipelineDepthStencilStateCreateInfo){
+                   .sType =
+                       VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+                   .depthTestEnable = VK_TRUE,
+                   .depthWriteEnable = VK_TRUE,
+                   .depthCompareOp = VK_COMPARE_OP_LESS,
+                   .depthBoundsTestEnable = VK_FALSE,
+                   .stencilTestEnable = VK_FALSE,
+                   .front = {.failOp = VK_STENCIL_OP_KEEP,
+                             .passOp = VK_STENCIL_OP_KEEP,
+                             .compareOp = VK_COMPARE_OP_ALWAYS},
+                   .back = {.failOp = VK_STENCIL_OP_KEEP,
+                            .passOp = VK_STENCIL_OP_KEEP,
+                            .compareOp = VK_COMPARE_OP_ALWAYS},
+                   .minDepthBounds = -5,
+                   .maxDepthBounds = 100},
+           .pColorBlendState =
+               &(VkPipelineColorBlendStateCreateInfo){
+                   .sType =
+                       VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+                   .logicOpEnable = VK_FALSE,
+                   .attachmentCount = 1,
+                   .pAttachments =
+                       &(VkPipelineColorBlendAttachmentState){
+                           .colorWriteMask = VK_COLOR_COMPONENT_R_BIT |
+                                             VK_COLOR_COMPONENT_G_BIT |
+                                             VK_COLOR_COMPONENT_B_BIT |
+                                             VK_COLOR_COMPONENT_A_BIT,
+                           .blendEnable = VK_TRUE,
+                           .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
+                           .dstColorBlendFactor =
+                               VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+                           .colorBlendOp = VK_BLEND_OP_ADD,
+                           .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+                           .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
+                           .alphaBlendOp = VK_BLEND_OP_ADD},
+                   .blendConstants = {0.f, 0.f, 0.f, 0.f}},
+           .pDynamicState = NULL,
+           .layout = state->layout,
+           .renderPass = state->renderPass,
+           .subpass = 0},
+      },
+      NULL, state->graphicsPipelines);
 }
 
 void CreateRenderState(GraphicsState *state) {
@@ -1018,193 +1263,11 @@ void CreateRenderState(GraphicsState *state) {
                             .layers = 1},
                         0, &state->framebuffers[i]);
   }
-
-  vkCreatePipelineLayout(
-      state->device,
-      &(VkPipelineLayoutCreateInfo){
-          .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-          .setLayoutCount = 1,
-          .pSetLayouts = (VkDescriptorSetLayout[1]){state->descriptorSetLayout},
-          .pushConstantRangeCount = 0,
-          .pPushConstantRanges = NULL},
-      NULL, &state->layout);
-  vkCreateGraphicsPipelines(
-      state->device, VK_NULL_HANDLE, 1,
-      (VkGraphicsPipelineCreateInfo[1]){
-          {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-           .stageCount = 2,
-           .pStages =
-               (VkPipelineShaderStageCreateInfo[2]){
-                   {.sType =
-                        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                    .stage = VK_SHADER_STAGE_VERTEX_BIT,
-                    .module = LoadShaderFromFile(state->device,
-                                                 "./shaders/vertex.spv"),
-                    .pName = "main"},
-                   {.sType =
-                        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                    .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-                    .module = LoadShaderFromFile(state->device,
-                                                 "./shaders/fragment.spv"),
-                    .pName = "main"}},
-           .pVertexInputState =
-               &(VkPipelineVertexInputStateCreateInfo){
-                   .sType =
-                       VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-                   .vertexBindingDescriptionCount = 2,
-                   .pVertexBindingDescriptions =
-                       (VkVertexInputBindingDescription[2]){
-                           {.binding = 0,
-                            .stride = sizeof(Vertex),
-                            .inputRate = VK_VERTEX_INPUT_RATE_VERTEX},
-                           {.binding = 1,
-                            .stride = sizeof(Instance),
-                            .inputRate = VK_VERTEX_INPUT_RATE_INSTANCE}},
-                   .vertexAttributeDescriptionCount = 14,
-                   .pVertexAttributeDescriptions =
-                       (VkVertexInputAttributeDescription[14]){
-                           {.location = 0,
-                            .binding = 0,
-                            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
-                            .offset = offsetof(Vertex, position)},
-                           {.location = 1,
-                            .binding = 0,
-                            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
-                            .offset = offsetof(Vertex, color)},
-                           {.location = 2,
-                            .binding = 0,
-                            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
-                            .offset = offsetof(Vertex, normal)},
-                           {.location = 3,
-                            .binding = 1,
-                            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
-                            .offset = offsetof(Instance, rotation[0])},
-                           {.location = 4,
-                            .binding = 1,
-                            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
-                            .offset = offsetof(Instance, rotation[1])},
-                           {.location = 5,
-                            .binding = 1,
-                            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
-                            .offset = offsetof(Instance, rotation[2])},
-                           {.location = 6,
-                            .binding = 1,
-                            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
-                            .offset = offsetof(Instance, rotation[3])},
-                           {.location = 7,
-                            .binding = 1,
-                            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
-                            .offset = offsetof(Instance, position)},
-                           {.location = 8,
-                            .binding = 1,
-                            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
-                            .offset = offsetof(Instance, scale)},
-                           {.location = 9,
-                            .binding = 1,
-                            .format = VK_FORMAT_R32_UINT,
-                            .offset = offsetof(Instance, instanceId)},
-                           {.location = 10,
-                            .binding = 1,
-                            .format = VK_FORMAT_R32_UINT,
-                            .offset = offsetof(Instance, textureId1)},
-                           {.location = 11,
-                            .binding = 1,
-                            .format = VK_FORMAT_R32_UINT,
-                            .offset = offsetof(Instance, textureId2)},
-                           {.location = 12,
-                            .binding = 0,
-                            .format = VK_FORMAT_R32G32_SFLOAT,
-                            .offset = offsetof(Vertex, uvcoords)},
-                           {.location = 13,
-                            .binding = 0,
-                            .format = VK_FORMAT_R32_SFLOAT,
-                            .offset = offsetof(Vertex, blendFactor)}}},
-           .pInputAssemblyState =
-               &(VkPipelineInputAssemblyStateCreateInfo){
-                   .sType =
-                       VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-                   .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST},
-           .pViewportState =
-               &(VkPipelineViewportStateCreateInfo){
-                   .sType =
-                       VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-                   .viewportCount = 1,
-                   .pViewports = &(
-                       VkViewport){.x = 0,
-                                   .y = 0,
-                                   .width = capabilites.maxImageExtent.width,
-                                   .height = capabilites.maxImageExtent.height,
-                                   .minDepth = 0,
-                                   .maxDepth = 1},
-                   .scissorCount = 1,
-                   .pScissors =
-                       &(VkRect2D){.extent = capabilites.maxImageExtent,
-                                   .offset = {0, 0}}},
-           .pRasterizationState =
-               &(VkPipelineRasterizationStateCreateInfo){
-                   .sType =
-                       VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-                   .depthClampEnable = VK_FALSE,
-                   .rasterizerDiscardEnable = VK_FALSE,
-                   .polygonMode = VK_POLYGON_MODE_FILL,
-                   .lineWidth = 1.f,
-                   .cullMode = VK_CULL_MODE_BACK_BIT,
-                   .frontFace = VK_FRONT_FACE_CLOCKWISE},
-           .pMultisampleState =
-               &(VkPipelineMultisampleStateCreateInfo){
-                   .sType =
-                       VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-                   .sampleShadingEnable = VK_FALSE,
-                   .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
-                   .minSampleShading = 1.f},
-           .pDepthStencilState =
-               &(VkPipelineDepthStencilStateCreateInfo){
-                   .sType =
-                       VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
-                   .depthTestEnable = VK_TRUE,
-                   .depthWriteEnable = VK_TRUE,
-                   .depthCompareOp = VK_COMPARE_OP_LESS,
-                   .depthBoundsTestEnable = VK_FALSE,
-                   .stencilTestEnable = VK_FALSE,
-                   .front = {.failOp = VK_STENCIL_OP_KEEP,
-                             .passOp = VK_STENCIL_OP_KEEP,
-                             .compareOp = VK_COMPARE_OP_ALWAYS},
-                   .back = {.failOp = VK_STENCIL_OP_KEEP,
-                            .passOp = VK_STENCIL_OP_KEEP,
-                            .compareOp = VK_COMPARE_OP_ALWAYS},
-                   .minDepthBounds = -5,
-                   .maxDepthBounds = 100},
-           .pColorBlendState =
-               &(VkPipelineColorBlendStateCreateInfo){
-                   .sType =
-                       VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-                   .logicOpEnable = VK_FALSE,
-                   .attachmentCount = 1,
-                   .pAttachments =
-                       &(VkPipelineColorBlendAttachmentState){
-                           .colorWriteMask = VK_COLOR_COMPONENT_R_BIT |
-                                             VK_COLOR_COMPONENT_G_BIT |
-                                             VK_COLOR_COMPONENT_B_BIT |
-                                             VK_COLOR_COMPONENT_A_BIT,
-                           .blendEnable = VK_TRUE,
-                           .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
-                           .dstColorBlendFactor =
-                               VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
-                           .colorBlendOp = VK_BLEND_OP_ADD,
-                           .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
-                           .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
-                           .alphaBlendOp = VK_BLEND_OP_ADD},
-                   .blendConstants = {0.f, 0.f, 0.f, 0.f}},
-           .pDynamicState = NULL,
-           .layout = state->layout,
-           .renderPass = state->renderPass,
-           .subpass = 0},
-      },
-      NULL, state->graphicsPipelines);
+  CreateGenericPipeline(state);
   glm_perspective(80,
                   (float)capabilites.currentExtent.width /
                       (float)capabilites.currentExtent.height,
-                  0.01, 500, state->camera->proj);
+                  0.1, 500, state->camera->proj);
 }
 
 void CleanRenderState(GraphicsState *state) {
@@ -1246,10 +1309,17 @@ GraphicsState InitGraphics() {
       physicalDevice = physicalDevices[i];
       VkPhysicalDeviceFeatures features;
       vkGetPhysicalDeviceFeatures(physicalDevice, &features);
+      VkFormatProperties formatProps;
+      vkGetPhysicalDeviceFormatProperties(
+          physicalDevice, VK_FORMAT_R8G8B8A8_UNORM, &formatProps);
       if (!features.fragmentStoresAndAtomics) {
         printf("Rejecting device, lacks fragmentStoresAndAtomics\n");
         physicalDevice = NULL;
         continue;
+      } else if (!(formatProps.optimalTilingFeatures &
+                   VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)) {
+        printf("Rejecting device, lacks linear filtering\n");
+        physicalDevice = NULL;
       } else {
         break;
       }
@@ -1326,7 +1396,7 @@ GraphicsState InitGraphics() {
   // Model loading
   CreateBuffer(device, physicalDevice, 50000000 * sizeof(Vertex),
                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
-               VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &state.stagingBuffer,
+               VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 1, &state.stagingBuffer,
                &state.stagingMemory);
   vkMapMemory(state.device, state.stagingMemory, 0, VK_WHOLE_SIZE, 0,
               &state.mappedStagingMemory);
@@ -1340,21 +1410,23 @@ GraphicsState InitGraphics() {
                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                    VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-               &state.cameraBuffer, &state.cameraMemory);
-  printf("%d\n", vkMapMemory(device, state.cameraMemory, 0, VK_WHOLE_SIZE, 0,
-                             (void **)&state.camera));
+               1, &state.cameraBuffer, &state.cameraMemory);
   CreateBuffer(device, physicalDevice, sizeof(InputState),
                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-               &state.inputBuffer, &state.inputMemory);
-  printf("%d\n", vkMapMemory(device, state.inputMemory, 0, VK_WHOLE_SIZE, 0,
-                             (void **)&state.input));
-  memset(state.input->selectionBuffer, 0, sizeof(state.input->selectionBuffer));
-  memset(state.input->selectionMap, 0, sizeof(state.input->selectionMap));
+               1, &state.inputBuffer, &state.inputMemory);
+  CreateBuffer(state.device, state.physicalDevice, sizeof(InputOutputBuffer),
+               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, state.imageCount,
+               state.input->inputOutputBuffers,
+               &state.input->inputOutputMemory);
 
-  glm_mat4_identity_array(&state.camera->model, 3);
+  glm_mat4_identity_array(&state.camera->mvp, 4);
+  glm_translate(state.camera->view, (vec3){0, 0, 0});
   CreateRenderState(&state);
   return state;
 }
@@ -1366,7 +1438,7 @@ void ReadInputData(GraphicsState *state) {
                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                      VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                 &state->stagingInputBuffer, &state->stagingInputMemory);
+                 1, &state->stagingInputBuffer, &state->stagingInputMemory);
     vkCreateFence(
         state->device,
         &(VkFenceCreateInfo){.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO},
@@ -1446,18 +1518,25 @@ void MoveCamera(GraphicsState *state) {
   vec4 cameraVelocity = {
       (glfwGetKey(state->window, GLFW_KEY_A) * CAMERA_MOVE_SPEED -
        glfwGetKey(state->window, GLFW_KEY_D) * CAMERA_MOVE_SPEED) *
-          (1 + glfwGetKey(state->window, GLFW_KEY_LEFT_SHIFT)),
+          (1 + glfwGetKey(state->window, GLFW_KEY_LEFT_SHIFT) * 10),
       0.,
       (glfwGetKey(state->window, GLFW_KEY_S) * CAMERA_MOVE_SPEED -
        glfwGetKey(state->window, GLFW_KEY_W) * CAMERA_MOVE_SPEED) *
-          (1 + glfwGetKey(state->window, GLFW_KEY_LEFT_SHIFT)),
+          (1 + glfwGetKey(state->window, GLFW_KEY_LEFT_SHIFT) * 10),
       1};
   glm_translate(state->camera->view, cameraVelocity);
+  mat4 invView;
+  glm_mat4_inv(state->camera->view, invView);
+  glm_mat4_mul(state->camera->proj, invView, state->camera->mvp);
 }
 
 void DrawGraphics(GraphicsState *state) {
+
+  // Update states
   UpdateInputState(state);
   UpdateGraphicsMemory(state);
+
+  // Setup buffer if needed
   if (state->commandBufferDirty) {
     VkSurfaceCapabilitiesKHR capabilites;
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(state->physicalDevice,
@@ -1468,8 +1547,9 @@ void DrawGraphics(GraphicsState *state) {
     }
     state->commandBufferDirty = false;
   }
-  uint32_t image_index = (state->imageId + 1) % (state->imageCount + 1);
 
+  // Determine frame id
+  uint32_t image_index = (state->imageId + 1) % (state->imageCount + 1);
   uint32_t imageId;
   VkResult result = vkAcquireNextImageKHR(
       state->device, state->swapchain, 1e8,
@@ -1494,6 +1574,12 @@ void DrawGraphics(GraphicsState *state) {
     printf("Failure to fetch image err: %d.. Returning\n", result);
     return;
   }
+
+  // Wait for results of last draw
+  vkWaitForFences(state->device, 1, &state->imageReadyFences[imageId], 1,
+                  10000000);
+  vkResetFences(state->device, 1, &state->imageReadyFences[imageId]);
+  // Submit draw command buffer
   vkQueueSubmit(
       queue, 1,
       &(VkSubmitInfo){
@@ -1516,8 +1602,6 @@ void DrawGraphics(GraphicsState *state) {
                                      &state->renderFinishedSemaphores[imageId],
                                  .pSwapchains = &state->swapchain,
                                  .pImageIndices = &imageId});
-  vkWaitForFences(state->device, 1, &state->imageReadyFences[imageId], 1,
-                  10000000);
-  vkResetFences(state->device, 1, &state->imageReadyFences[imageId]);
+
   state->imageId = image_index;
 }
