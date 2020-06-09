@@ -126,11 +126,11 @@ typedef struct CameraState {
 } CameraState;
 
 typedef struct InputOutputBuffer {
+  vec4 worldMouse;
+  int worldMouseDepth;
   uint32_t selectionBufferLength;
   uint32_t selectionBuffer[256];
   char selectionMap[65536];
-  int worldMouseDepth;
-  vec4 worldMouse;
 } InputOutputBuffer;
 
 typedef struct InputInputBuffer {
@@ -148,7 +148,10 @@ typedef struct InputState {
   VkDeviceMemory inputOutputMemory;
   VkBuffer inputInputBuffer;
   VkDeviceMemory inputInputMemory;
+  VkBuffer inputOutputOutputBuffer;
+  VkDeviceMemory inputOutputOutputMemory;
   InputInputBuffer *mappedIIB;
+  InputOutputBuffer *mappedIOOB;
 } InputState;
 
 typedef struct GraphicsState {
@@ -192,7 +195,7 @@ typedef struct GraphicsState {
   VkFence stagingFence;
   // Textures
   uint32_t textureCount;
-  Texture *textures[512]; // TODO: More magic array lengths
+  Texture *textures[16]; // TODO: More magic array lengths
   // Entities
   EntityDef *entities;
   size_t entityCount;
@@ -285,6 +288,12 @@ void SetupCommandBuffer(GraphicsState *state, int frameNumber,
               entities[i].instanceCount, 0, 0);
   }
   vkCmdEndRenderPass(state->commandbuffers[frameNumber]);
+  vkCmdCopyBuffer(state->commandbuffers[frameNumber],
+                  state->input.inputOutputBuffers[frameNumber],
+                  state->input.inputOutputOutputBuffer, 1,
+                  &(VkBufferCopy){.srcOffset = 0,
+                                  .dstOffset = 0,
+                                  .size = sizeof(InputOutputBuffer)});
   vkEndCommandBuffer(state->commandbuffers[frameNumber]);
 }
 
@@ -363,13 +372,8 @@ void UpdateInputState(GraphicsState *state) {
     state->input.mouse[0] = xpos;
     state->input.mouse[1] = ypos;
   }
-  InputOutputBuffer *buf = NULL;
-  vkMapMemory(state->device, state->input.inputOutputMemory,
-              sizeof(InputOutputBuffer) *
-                  ((state->imageId + 1) % state->imageCount),
-              sizeof(InputOutputBuffer), 0, (void **)&buf);
-  memcpy(state->input.worldMouse, buf->worldMouse, sizeof(vec4));
-  vkUnmapMemory(state->device, state->input.inputOutputMemory);
+  memcpy(state->input.worldMouse, state->input.mappedIOOB->worldMouse,
+         sizeof(vec4));
 
   // Box drag start
   if ((state->input.mouseButtons & 2) == 0) {
@@ -378,13 +382,19 @@ void UpdateInputState(GraphicsState *state) {
   }
   state->input.mappedIIB->mouseButtons = state->input.mouseButtons;
   memcpy(state->input.mappedIIB->mouse, state->input.mouse, sizeof(vec4));
+  memcpy(state->input.mappedIIB->windowSize, state->input.windowSize,
+         sizeof(vec2));
 }
 
 void UpdateDescriptors(GraphicsState *state) {
   VkWriteDescriptorSet vwds[MAX_SWAPCHAIN_IMAGES * 3];
+  VkDescriptorBufferInfo bufferInfos[state->imageCount * 2];
 
   // == UNIFORM BUFFERS
   for (uint32_t i = 0; i < state->imageCount; i++) {
+    bufferInfos[i] = (VkDescriptorBufferInfo){.buffer = state->cameraBuffer,
+                                              .offset = 0,
+                                              .range = sizeof(CameraState)};
     vwds[i] = (VkWriteDescriptorSet){
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
         .dstSet = state->descriptorSets[i],
@@ -392,15 +402,21 @@ void UpdateDescriptors(GraphicsState *state) {
         .descriptorCount = 1,
         .dstBinding = 0,
         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        .pBufferInfo = &(VkDescriptorBufferInfo){.buffer = state->cameraBuffer,
-                                                 .offset = 0,
-                                                 .range = sizeof(CameraState)}};
+        .pBufferInfo = &bufferInfos[i]};
   }
   vkUpdateDescriptorSets(state->device, state->imageCount, vwds, 0,
                          VK_NULL_HANDLE);
 
   // == STORAGE BUFFERS
   for (uint32_t i = 0; i < state->imageCount; i++) {
+    bufferInfos[i * 2] =
+        (VkDescriptorBufferInfo){.buffer = state->input.inputInputBuffer,
+                                 .offset = 0,
+                                 .range = sizeof(InputInputBuffer)};
+    bufferInfos[i * 2 + 1] =
+        (VkDescriptorBufferInfo){.buffer = state->input.inputOutputBuffers[i],
+                                 .offset = 0,
+                                 .range = sizeof(InputOutputBuffer)};
     vwds[i * 2] = (VkWriteDescriptorSet){
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
         .dstSet = state->descriptorSets[i],
@@ -408,21 +424,15 @@ void UpdateDescriptors(GraphicsState *state) {
         .descriptorCount = 1,
         .dstBinding = 1,
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .pBufferInfo =
-            &(VkDescriptorBufferInfo){.buffer = state->input.inputInputBuffer,
-                                      .offset = 0,
-                                      .range = sizeof(InputInputBuffer)}};
+        .pBufferInfo = &bufferInfos[i * 2]};
     vwds[i * 2 + 1] = (VkWriteDescriptorSet){
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
         .dstSet = state->descriptorSets[i],
         .dstArrayElement = 0,
         .descriptorCount = 1,
-        .dstBinding = 3,
+        .dstBinding = 2,
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .pBufferInfo = &(VkDescriptorBufferInfo){
-            .buffer = state->input.inputOutputBuffers[i],
-            .offset = 0,
-            .range = sizeof(InputOutputBuffer)}};
+        .pBufferInfo = &bufferInfos[i * 2 + 1]};
   }
   vkUpdateDescriptorSets(state->device, state->imageCount * 2, vwds, 0,
                          VK_NULL_HANDLE);
@@ -443,13 +453,12 @@ void UpdateDescriptors(GraphicsState *state) {
           .descriptorCount = state->textureCount,
           .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
           .dstArrayElement = 0,
-          .dstBinding = 2,
+          .dstBinding = 3,
           .dstSet = state->descriptorSets[i],
           .pImageInfo = vdif};
     }
-    /*vkUpdateDescriptorSets(state->device, state->imageCount, vwds, 0,
+    vkUpdateDescriptorSets(state->device, state->imageCount, vwds, 0,
                            VK_NULL_HANDLE);
-													 */
   }
 }
 // TODO: Something wrong with sizing here, vulkan allocates a texture image of
@@ -542,21 +551,6 @@ uint32_t OpenTexture(GraphicsState *state, Texture *texture, char *filename) {
   vkBeginCommandBuffer(
       cb, &(VkCommandBufferBeginInfo){
               .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO});
-  vkCmdPipelineBarrier(
-      cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
-      NULL, 0, NULL, 1,
-      &(VkImageMemoryBarrier){
-          .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-          .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-          .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-          .image = texture->image,
-          .subresourceRange = {.baseMipLevel = 0,
-                               .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                               .layerCount = 1,
-                               .baseArrayLayer = 0,
-                               .levelCount = VK_REMAINING_MIP_LEVELS},
-          .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-          .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT});
   vkCmdCopyBufferToImage(
       cb, state->stagingBuffer, texture->image,
       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
@@ -742,7 +736,7 @@ uint32_t AddEntityInstance(EntityDef *entity, Instance instance) {
   static uint32_t instanceId = 0;
   instance.instanceId = instanceId++;
 
-  if (entity->maxInstances > entity->instanceCount) {
+  if (entity->maxInstances <= entity->instanceCount) {
     entity->maxInstances = entity->maxInstances + 64;
     entity->instances =
         realloc(entity->instances, sizeof(Instance) * entity->maxInstances);
@@ -873,16 +867,16 @@ void SetupDescriptorSets(GraphicsState *state) {
                    .stageFlags = VK_SHADER_STAGE_VERTEX_BIT |
                                  VK_SHADER_STAGE_FRAGMENT_BIT},
                   {.binding = 2,
+                   .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                   .descriptorCount = 1,
+                   .stageFlags = VK_SHADER_STAGE_VERTEX_BIT |
+                                 VK_SHADER_STAGE_FRAGMENT_BIT},
+                  {.binding = 3,
                    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                    .descriptorCount =
                        16, // TODO: Totally arbitrary, *will* run out soon.
                            // Texture should be swapped in and out
-                   .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT},
-                  {.binding = 3,
-                   .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                   .descriptorCount = 1,
-                   .stageFlags = VK_SHADER_STAGE_VERTEX_BIT |
-                                 VK_SHADER_STAGE_FRAGMENT_BIT}}},
+                   .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT}}},
       NULL, &state->descriptorSetLayout);
   vkCreateDescriptorPool(
       state->device,
@@ -897,7 +891,7 @@ void SetupDescriptorSets(GraphicsState *state) {
                   {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                    .descriptorCount = MAX_SWAPCHAIN_IMAGES * 2},
                   {.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                   .descriptorCount = 512 * MAX_SWAPCHAIN_IMAGES}}},
+                   .descriptorCount = 16 * MAX_SWAPCHAIN_IMAGES}}},
       NULL, &state->descriptorPool);
   vkAllocateDescriptorSets(
       state->device,
@@ -926,7 +920,7 @@ void CreateGenericPipeline(GraphicsState *state) {
       &(VkPipelineLayoutCreateInfo){
           .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
           .setLayoutCount = 1,
-          .pSetLayouts = (VkDescriptorSetLayout[1]){state->descriptorSetLayout},
+          .pSetLayouts = &state->descriptorSetLayout,
           .pushConstantRangeCount = 0,
           .pPushConstantRanges = NULL},
       NULL, &state->layout);
@@ -1184,9 +1178,9 @@ void CreateRenderState(GraphicsState *state) {
                        &(VkAttachmentReference){
                            1,
                            VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL}}},
-          .dependencyCount = 1,
+          .dependencyCount = 2,
           .pDependencies =
-              (VkSubpassDependency[1]){
+              (VkSubpassDependency[2]){
                   {.srcSubpass = VK_SUBPASS_EXTERNAL,
                    .dstSubpass = 0,
                    .srcStageMask =
@@ -1194,7 +1188,13 @@ void CreateRenderState(GraphicsState *state) {
                    .srcAccessMask = 0,
                    .dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
                    .dstAccessMask =
-                       VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT}}},
+                       VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT},
+                  {.srcSubpass = 0,
+                   .dstSubpass = VK_SUBPASS_EXTERNAL,
+                   .srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                   .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                   .dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT,
+                   .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT}}},
       0, &state->renderPass);
 
   vkGetSwapchainImagesKHR(state->device, state->swapchain, &count, NULL);
@@ -1437,12 +1437,19 @@ GraphicsState InitGraphics() {
   vkMapMemory(device, state.input.inputInputMemory, 0, sizeof(InputInputBuffer),
               0, (void **)&state.input.mappedIIB);
   CreateBuffer(device, physicalDevice, sizeof(InputOutputBuffer),
-               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
-                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-               VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+               VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                   VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                MAX_SWAPCHAIN_IMAGES, state.input.inputOutputBuffers,
                &state.input.inputOutputMemory);
+  CreateBuffer(device, physicalDevice, sizeof(InputOutputBuffer),
+               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+               VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1,
+               &state.input.inputOutputOutputBuffer,
+               &state.input.inputOutputOutputMemory);
+  vkMapMemory(state.device, state.input.inputOutputOutputMemory, 0,
+              sizeof(InputOutputBuffer), 0, (void **)&state.input.mappedIOOB);
 
   glm_mat4_identity_array(&state.camera->mvp, 4);
   glm_translate(state.camera->view, (vec3){0, 0, 0});

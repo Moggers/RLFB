@@ -25,12 +25,12 @@ layout(set = 0, binding = 1) buffer Block {
   uint mouseButtons;
 };
 
-layout(set = 0, binding = 3) buffer Block {
+layout(set = 0, binding = 2) buffer Block {
+	vec4 worldMouse;
+	int worldMouseDepth;
 	uint selectionBufferLength;
   uint selectionMap[65536];
   uint selectionBuffer[256];
-	int worldMouseDepth;
-	vec4 worldMouse;
 };
 
 layout(location = 0) out vec4 fragColor;

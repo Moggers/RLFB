@@ -11,25 +11,25 @@ layout(location = 6) in float blendFactor;
 layout(location = 7) in vec4 worldCoord;
 
 layout(location = 0) out vec4 outColor;
-layout(set = 0, binding = 1) buffer InputIn {
+layout(binding = 1) buffer InputIn {
 	vec4 mouse;
 	vec2 windowSize;
 	uint mouseButtons;
 };
-layout(binding = 2) uniform sampler2D textures[16];
-layout(set = 0, binding = 3) buffer InputOut {
+layout(binding = 2) buffer InputOut {
+	vec4 worldMouse;
+	int worldMouseDepth;
 	uint selectionBufferLength;
 	uint selectionMap[65536];
 	uint selectionBuffer[256];
-	int worldMouseDepth;
-	vec4 worldMouse;
 };
+layout(binding = 3) uniform sampler2D textures[16];
 
 void main() {
 	vec2 adjustedFrag = floor(vec2(gl_FragCoord));
 	if( mouse.x == adjustedFrag.x && mouse.y == adjustedFrag.y) {
-		int oldDepth = atomicMin(worldMouseDepth, int(gl_FragCoord.z * 1000000));
-		if(oldDepth >= gl_FragCoord.z) {
+		int oldDepth = atomicMax(worldMouseDepth, int((1-gl_FragCoord.z) * 1000000));
+		if(oldDepth <= gl_FragCoord.z) {
 			worldMouse[0] = worldCoord[0];
 			worldMouse[1] = worldCoord[1];
 			worldMouse[2] = worldCoord[2];
