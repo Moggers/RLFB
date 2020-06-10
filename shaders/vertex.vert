@@ -45,9 +45,6 @@ layout(location = 4) out flat uint outTextureId2;
 layout(location = 5) out vec2 outUV;
 layout(location = 6) out float outBlendFactor;
 layout(location = 7) out vec4 worldCoord;
-layout(location = 8) out float billboardYaw;
-layout(location = 9) out vec3 camPosRel;
-layout(location = 10) out vec3 rotated;
 
 mat4 rotationY( in float angle ) {
 	return mat4(	
@@ -61,12 +58,11 @@ mat4 rotationY( in float angle ) {
 
 void main() {
 	outUV = uvcoords;
-	rotated = inPosition * instanceScale;
 	if(billboard == 1) {
-		camPosRel = vec3((cameraPosition*2-vec4(instancePosition, 0)) * instanceRotation);
+		vec3 camPosRel = vec3((cameraPosition*2-vec4(instancePosition, 0)) * instanceRotation);
 		camPosRel.y = 0;
 		camPosRel = normalize(camPosRel);
-		billboardYaw = atan(camPosRel.x, camPosRel.z);
+		float billboardYaw = atan(camPosRel.x, camPosRel.z);
 		if(billboardYaw <= 0) {
 			outUV *= vec2(-1,1);
 			if(billboardYaw < M_PI * -0.2 && billboardYaw > M_PI * -0.8) {
@@ -85,10 +81,10 @@ void main() {
 				billboardYaw -= M_PI * 0.2;
 			}
 		}
-		mat4 billboardRotation = rotationY(billboardYaw);
-		rotated = vec3(vec4(rotated,1) * billboardRotation);
-	} 
-	worldCoord = ((instanceRotation * vec4(rotated,1) + vec4( instancePosition,1)));
+		worldCoord = ((instanceRotation * (vec4(inPosition * instanceScale,1) * rotationY(billboardYaw)) + vec4( instancePosition,1)));
+	} else {
+		worldCoord = ((instanceRotation * vec4(inPosition * instanceScale, 1) + vec4( instancePosition,1)));
+	}
 	gl_Position = mvp * worldCoord;
 	fragColor = inColor;
 	lightAdjust = abs(dot(normalize(vec3(instanceRotation * vec4(inNorm, 1))), normalize(vec3(0, 1, 1))));

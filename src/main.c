@@ -6,40 +6,47 @@
 #include <cglm/vec3.h>
 #define STB_PERLIN_IMPLEMENTATION
 #include "stb_perlin.h"
+#include <flecs.h>
 
 typedef struct Unit {
   vec3 target;
-  Instance *instance;
+  EntityDef *entity;
+  uint32_t instanceId;
 } Unit;
 
 void updateUnit(Unit *unit, InputState *state) {
+  Instance *instance = &unit->entity->instances[unit->instanceId];
   if (state->mouseButtons & 2) {
     unit->target[0] = state->worldMouse[0];
     unit->target[1] = state->worldMouse[1];
     unit->target[2] = state->worldMouse[2];
+    glm_lookat((vec3){0, 0, 0},
+               (vec3){unit->target[0] - instance->position[0], 0,
+                      unit->target[2] - instance->position[2]},
+               (vec3){0, 1, 0}, instance->rotation);
+    glm_mat4_inv(instance->rotation, instance->rotation);
   }
   if (unit->target[0] == 0 && unit->target[1] == 0 && unit->target[2] == 0) {
-    unit->target[0] = unit->instance->position[0];
-    unit->target[1] = unit->instance->position[1];
-    unit->target[2] = unit->instance->position[2];
-  } else if (glm_vec3_distance(unit->instance->position, unit->target) > 0.1) {
-    glm_lookat((vec3){0, 0, 0},
-               (vec3){unit->target[0] - unit->instance->position[0], 0,
-                      unit->target[2] - unit->instance->position[2]},
-               (vec3){0, 1, 0}, unit->instance->rotation);
-    glm_mat4_inv(unit->instance->rotation, unit->instance->rotation);
+    unit->target[0] = instance->position[0];
+    unit->target[1] = instance->position[1];
+    unit->target[2] = instance->position[2];
+  } else if (glm_vec3_distance(instance->position, unit->target) > 0.1) {
+    vec3 vel;
+    glm_vec3_sub(unit->target, instance->position, vel);
+    glm_normalize(vel);
+    glm_vec3_mul(vel, (vec3){0.002, 0.002, 0.002}, vel);
+    glm_vec3_add(instance->position, vel, instance->position);
+    instance->position[1] =
+        stb_perlin_fbm_noise3(instance->position[0] / 512.f, 0,
+                              instance->position[2] / 512.f, 2.3, 0.3, 6) *
+        100;
+    instance->billboard = true;
+    unit->entity->dirtyBuffer[unit->instanceId] = true;
   }
-  vec3 vel;
-  glm_vec3_sub(unit->target, unit->instance->position, vel);
-  glm_normalize(vel);
-  glm_vec3_mul(vel, (vec3){0.002, 0.002, 0.002}, vel);
-  glm_vec3_add(unit->instance->position, vel, unit->instance->position);
-  unit->instance->position[1] =
-      stb_perlin_fbm_noise3(unit->instance->position[0] / 512.f, 0,
-                            unit->instance->position[2] / 512.f, 2.3, 0.3, 6) *
-      100;
-  unit->instance->billboard = true;
-  *unit->instance->dirty = true;
+  if (!instance->billboard) {
+    instance->billboard = true;
+    unit->entity->dirtyBuffer[unit->instanceId] = true;
+  }
 }
 
 int main(int argc, char **argv) {
@@ -323,9 +330,9 @@ int main(int argc, char **argv) {
                                                     .normal = {0, 0, -1},
                                                     .uvcoords = {1, 0}}}};
   uint32_t standardDef = CreateEntityDef(&graphics, &standard);
-#define UNIT_TEST_ROWS 8 
+#define UNIT_TEST_ROWS 32
 #define UNIT_TEST_COLUMNS 8
-#define UNIT_TEST_TOTAL UNIT_TEST_ROWS * UNIT_TEST_COLUMNS
+#define UNIT_TEST_TOTAL UNIT_TEST_ROWS *UNIT_TEST_COLUMNS
   Unit units[UNIT_TEST_TOTAL];
   for (uint32_t t = 0; t < UNIT_TEST_COLUMNS; t++) {
     for (uint32_t i = 0; i < UNIT_TEST_ROWS; i++) {
@@ -344,13 +351,20 @@ int main(int argc, char **argv) {
       uint32_t standardId =
           AddEntityInstance(&graphics.entities[standardDef], standardInstance);
 
-      units[t * UNIT_TEST_COLUMNS + i] = (Unit){
+      units[t * UNIT_TEST_ROWS + i] = (Unit){
           .target = {0, 0, 0},
-          .instance = &graphics.entities[standardDef].instances[standardId]};
+          .instanceId = standardId,
+          .entity = &graphics.entities[standardDef],
+      };
     }
   }
+	
+	void Test(ecs_iter_t *it) {
+	}
 
-  while (true) {
+	ecs_world_t * world = ecs_init_w_args(argc, argv);
+
+	while(ecs_progress(world,0)) {
     if (glfwWindowShouldClose(graphics.window)) {
       return 0;
     }
@@ -361,4 +375,5 @@ int main(int argc, char **argv) {
     }
     DrawGraphics(&graphics);
   }
+	return ecs_fini(world);
 }
