@@ -1,6 +1,7 @@
 #include "engine.h"
 #include <GLFW/glfw3.h>
 #include <cglm/affine-mat.h>
+#include <cglm/cam.h>
 #include <cglm/mat4.h>
 #include <cglm/vec3.h>
 #define STB_PERLIN_IMPLEMENTATION
@@ -21,6 +22,12 @@ void updateUnit(Unit *unit, InputState *state) {
     unit->target[0] = unit->instance->position[0];
     unit->target[1] = unit->instance->position[1];
     unit->target[2] = unit->instance->position[2];
+  } else if (glm_vec3_distance(unit->instance->position, unit->target) > 0.1) {
+    glm_lookat((vec3){0, 0, 0},
+               (vec3){unit->target[0] - unit->instance->position[0], 0,
+                      unit->target[2] - unit->instance->position[2]},
+               (vec3){0, 1, 0}, unit->instance->rotation);
+    glm_mat4_inv(unit->instance->rotation, unit->instance->rotation);
   }
   vec3 vel;
   glm_vec3_sub(unit->target, unit->instance->position, vel);
@@ -31,6 +38,7 @@ void updateUnit(Unit *unit, InputState *state) {
       stb_perlin_fbm_noise3(unit->instance->position[0] / 512.f, 0,
                             unit->instance->position[2] / 512.f, 2.3, 0.3, 6) *
       100;
+  unit->instance->billboard = true;
   *unit->instance->dirty = true;
 }
 
@@ -290,47 +298,52 @@ int main(int argc, char **argv) {
   }
   // == STANDARD
   Model standard = (Model){.vertexCount = 6,
-                           .vertices = (Vertex[6]){{.position = {-0.5, 0, 0},
+                           .vertices = (Vertex[6]){{.position = {0, 0, -0.5},
                                                     .color = {1, 1, 1, 1},
-                                                    .normal = {0, 1, 0},
+                                                    .normal = {0, 0, -1},
                                                     .uvcoords = {0, 1}},
-                                                   {.position = {-0.5, 1, 0},
+                                                   {.position = {0, 1, -0.5},
                                                     .color = {1, 1, 1, 1},
-                                                    .normal = {0, 1, 0},
+                                                    .normal = {0, 0, -1},
                                                     .uvcoords = {0, 0}},
-                                                   {.position = {0.5, 1, 0},
+                                                   {.position = {0, 1, 0.5},
                                                     .color = {1, 1, 1, 1},
-                                                    .normal = {0, 1, 0},
+                                                    .normal = {0, 0, -1},
                                                     .uvcoords = {1, 0}},
-                                                   {.position = {0.5, 0, 0},
+                                                   {.position = {0, 0, 0.5},
                                                     .color = {1, 1, 1, 1},
-                                                    .normal = {0, 1, 0},
+                                                    .normal = {0, 0, -1},
                                                     .uvcoords = {1, 1}},
-                                                   {.position = {-0.5, 0, 0},
+                                                   {.position = {0, 0, -0.5},
                                                     .color = {1, 1, 1, 1},
-                                                    .normal = {0, 1, 0},
+                                                    .normal = {0, 0, -1},
                                                     .uvcoords = {0, 1}},
-                                                   {.position = {0.5, 1, 0},
+                                                   {.position = {0, 1, 0.5},
                                                     .color = {1, 1, 1, 1},
-                                                    .normal = {0, 1, 0},
+                                                    .normal = {0, 0, -1},
                                                     .uvcoords = {1, 0}}}};
   uint32_t standardDef = CreateEntityDef(&graphics, &standard);
-  Instance standardInstance = {
-      .position = {200,
-                   stb_perlin_fbm_noise3(200.f / 512.f, 0, 100.f / 512.f, 2.3,
-                                         0.3, 6) *
-                       100,
-                   // 0,
-                   100},
-      .scale = {0.01 * standardTexture.width, 0.01 * standardTexture.height, 1},
-      .textureId1 = standardTexture.textureId,
-      .textureId2 = standardTexture.textureId};
-  glm_mat4_identity(standardInstance.rotation);
-  uint32_t standardId =
-      AddEntityInstance(&graphics.entities[standardDef], standardInstance);
+  Unit units[32 * 32];
+  for (uint32_t t = 0; t < 32; t++) {
+    for (uint32_t i = 0; i < 32; i++) {
+      Instance standardInstance = {
+          .position = {200,
+                       stb_perlin_fbm_noise3(200.f / 512.f, 0, 100.f / 512.f,
+                                             2.3, 0.3, 6) *
+                           100,
+                       100},
+          .scale = {0.01 * standardTexture.width, 0.01 * standardTexture.height,
+                    0.01 * standardTexture.width},
+          .textureId1 = standardTexture.textureId,
+          .textureId2 = standardTexture.textureId};
+      glm_mat4_identity(standardInstance.rotation);
+      uint32_t standardId =
+          AddEntityInstance(&graphics.entities[standardDef], standardInstance);
 
-  Unit standardUnit = {
-      .instance = &graphics.entities[standardDef].instances[standardId]};
+      units[t * 32 + i] = (Unit){
+          .instance = &graphics.entities[standardDef].instances[standardId]};
+    }
+  }
 
   while (true) {
     if (glfwWindowShouldClose(graphics.window)) {
@@ -338,7 +351,9 @@ int main(int argc, char **argv) {
     }
     glfwPollEvents();
     MoveCamera(&graphics);
-    updateUnit(&standardUnit, &graphics.input);
+    for (uint32_t t = 0; t < 32 * 32; t++) {
+      updateUnit(&units[t], &graphics.input);
+    }
     DrawGraphics(&graphics);
   }
 }

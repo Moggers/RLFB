@@ -1,6 +1,7 @@
 #include <cglm/affine.h>
 #include <cglm/cglm.h>
 #include <cglm/mat4.h>
+#include <cglm/vec4.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -121,6 +122,7 @@ typedef struct CameraState {
   mat4 view;
   mat4 model;
   mat4 proj;
+	vec4 position;
   vec3 cameraVelocity;
   bool cameraTurning; // True = Holding down camera turn modifier
 } CameraState;
@@ -1496,6 +1498,7 @@ void MoveCamera(GraphicsState *state) {
   glm_translate(state->camera->view, cameraVelocity);
   mat4 invView;
   glm_mat4_inv(state->camera->view, invView);
+	glm_vec4_copy(state->camera->view[3], state->camera->position);
   glm_mat4_mul(state->camera->proj, invView, state->camera->mvp);
 }
 

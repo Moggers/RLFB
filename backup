@@ -1,4 +1,5 @@
 #!/bin/bash
 while inotifywait -r -e modify,create,delete,move .; do
+	sleep 0.5
 	rsync -avz . screeps:~/opendom
 done
