@@ -122,7 +122,7 @@ typedef struct CameraState {
   mat4 view;
   mat4 model;
   mat4 proj;
-	vec4 position;
+  vec4 position;
   vec3 cameraVelocity;
   bool cameraTurning; // True = Holding down camera turn modifier
 } CameraState;
@@ -465,7 +465,7 @@ void UpdateDescriptors(GraphicsState *state) {
 }
 // TODO: Something wrong with sizing here, vulkan allocates a texture image of
 // 			 larger size than required to ensure power-of-two sized
-// textures, so the 			 copy in *can* fail.
+// 			 textures, so the copy in *can* fail.
 uint32_t OpenTexture(GraphicsState *state, Texture *texture, char *filename) {
   stbi_uc *texturestart = stbi_load(filename, &texture->width, &texture->height,
                                     &texture->components, STBI_rgb_alpha);
@@ -1498,7 +1498,7 @@ void MoveCamera(GraphicsState *state) {
   glm_translate(state->camera->view, cameraVelocity);
   mat4 invView;
   glm_mat4_inv(state->camera->view, invView);
-	glm_vec4_copy(state->camera->view[3], state->camera->position);
+  glm_vec4_copy(state->camera->view[3], state->camera->position);
   glm_mat4_mul(state->camera->proj, invView, state->camera->mvp);
 }
 

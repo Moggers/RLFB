@@ -323,15 +323,19 @@ int main(int argc, char **argv) {
                                                     .normal = {0, 0, -1},
                                                     .uvcoords = {1, 0}}}};
   uint32_t standardDef = CreateEntityDef(&graphics, &standard);
-  Unit units[32 * 32];
-  for (uint32_t t = 0; t < 32; t++) {
-    for (uint32_t i = 0; i < 32; i++) {
+#define UNIT_TEST_ROWS 8 
+#define UNIT_TEST_COLUMNS 8
+#define UNIT_TEST_TOTAL UNIT_TEST_ROWS * UNIT_TEST_COLUMNS
+  Unit units[UNIT_TEST_TOTAL];
+  for (uint32_t t = 0; t < UNIT_TEST_COLUMNS; t++) {
+    for (uint32_t i = 0; i < UNIT_TEST_ROWS; i++) {
       Instance standardInstance = {
-          .position = {200,
-                       stb_perlin_fbm_noise3(200.f / 512.f, 0, 100.f / 512.f,
+          .position = {200 + (float)i / 2,
+                       stb_perlin_fbm_noise3((200.f + (float)i / 2) / 512.f, 0,
+                                             (100.f + (float)t / 2) / 512.f,
                                              2.3, 0.3, 6) *
                            100,
-                       100},
+                       100 + (float)t / 2},
           .scale = {0.01 * standardTexture.width, 0.01 * standardTexture.height,
                     0.01 * standardTexture.width},
           .textureId1 = standardTexture.textureId,
@@ -340,7 +344,8 @@ int main(int argc, char **argv) {
       uint32_t standardId =
           AddEntityInstance(&graphics.entities[standardDef], standardInstance);
 
-      units[t * 32 + i] = (Unit){
+      units[t * UNIT_TEST_COLUMNS + i] = (Unit){
+          .target = {0, 0, 0},
           .instance = &graphics.entities[standardDef].instances[standardId]};
     }
   }
@@ -351,7 +356,7 @@ int main(int argc, char **argv) {
     }
     glfwPollEvents();
     MoveCamera(&graphics);
-    for (uint32_t t = 0; t < 32 * 32; t++) {
+    for (uint32_t t = 0; t < UNIT_TEST_TOTAL; t++) {
       updateUnit(&units[t], &graphics.input);
     }
     DrawGraphics(&graphics);
